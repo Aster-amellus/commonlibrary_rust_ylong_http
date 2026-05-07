@@ -24,12 +24,14 @@ use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 use std::time::Duration;
 
-use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslStream, SslVerifyMode};
+use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslStream, SslVerifyMode, SslVersion};
 use ylong_http_client::async_impl::{Body, Client, RequestBuilder};
-use ylong_http_client::{HttpClientError, Proxy, TlsConfig, TlsFileType};
+use ylong_http_client::{HttpClientError, Proxy, TlsConfig, TlsFileType, TlsVersion};
 
 const CERT: &str = "tests/file/cert.pem";
 const KEY: &str = "tests/file/key.pem";
+const INVALID_CERT: &str = "tests/file/invalid_cert.pem";
+const INVALID_KEY: &str = "tests/file/invalid_key.pem";
 const ROOT_CA: &str = "tests/file/root-ca.pem";
 
 struct HttpsProxyHandle {
@@ -64,14 +66,36 @@ where
 }
 
 fn tls_acceptor(require_client_cert: bool) -> Result<SslAcceptor, String> {
+    tls_acceptor_config(require_client_cert, CERT, KEY, None, None, None)
+}
+
+fn tls_acceptor_config(
+    require_client_cert: bool,
+    cert: &str,
+    key: &str,
+    min_version: Option<SslVersion>,
+    max_version: Option<SslVersion>,
+    cipher_suites: Option<&str>,
+) -> Result<SslAcceptor, String> {
     let mut acceptor =
         SslAcceptor::mozilla_intermediate(SslMethod::tls()).map_err(|e| e.to_string())?;
     acceptor
-        .set_private_key_file(KEY, SslFiletype::PEM)
+        .set_private_key_file(key, SslFiletype::PEM)
         .map_err(|e| e.to_string())?;
     acceptor
-        .set_certificate_chain_file(CERT)
+        .set_certificate_chain_file(cert)
         .map_err(|e| e.to_string())?;
+    acceptor
+        .set_min_proto_version(min_version)
+        .map_err(|e| e.to_string())?;
+    acceptor
+        .set_max_proto_version(max_version)
+        .map_err(|e| e.to_string())?;
+    if let Some(cipher_suites) = cipher_suites {
+        acceptor
+            .set_ciphersuites(cipher_suites)
+            .map_err(|e| e.to_string())?;
+    }
     if require_client_cert {
         acceptor.set_ca_file(ROOT_CA).map_err(|e| e.to_string())?;
         acceptor.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
@@ -84,7 +108,18 @@ fn accept_proxy_tls(
     require_client_cert: bool,
 ) -> Result<SslStream<TcpStream>, String> {
     let acceptor = tls_acceptor(require_client_cert)?;
+    accept_proxy_tls_with_acceptor(listener, acceptor)
+}
+
+fn accept_proxy_tls_with_acceptor(
+    listener: TcpListener,
+    acceptor: SslAcceptor,
+) -> Result<SslStream<TcpStream>, String> {
     let (tcp, _) = listener.accept().map_err(|e| e.to_string())?;
+    tcp.set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    tcp.set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
     acceptor.accept(tcp).map_err(|e| e.to_string())
 }
 
@@ -112,6 +147,19 @@ fn assert_header(headers: &str, value: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("missing header `{value}` in `{headers}`"))
+    }
+}
+
+fn assert_no_header(headers: &str, name: &str) -> Result<(), String> {
+    let prefix = format!("{}:", name.to_ascii_lowercase());
+    if headers
+        .lines()
+        .skip(1)
+        .any(|line| line.to_ascii_lowercase().starts_with(&prefix))
+    {
+        Err(format!("unexpected header `{name}` in `{headers}`"))
+    } else {
+        Ok(())
     }
 }
 
@@ -163,10 +211,7 @@ fn sdv_http_target_over_https_proxy() {
         {
             return Err(format!("unexpected request line: {req}"));
         }
-        assert_header(
-            &req,
-            "proxy-authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
-        )?;
+        assert_header(&req, "proxy-authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQ=")?;
         stream
             .write_all(b"HTTP/1.1 201 OK\r\nContent-Length: 9\r\n\r\nproxy ok!")
             .map_err(|e| e.to_string())?;
@@ -206,7 +251,9 @@ fn sdv_https_target_over_https_proxy() {
             "proxy-authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
         )?;
         outer
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .write_all(
+                b"HTTP/1.1 200 Connection Established\r\nContent-Length: 999\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
             .map_err(|e| e.to_string())?;
 
         let acceptor = tls_acceptor(false)?;
@@ -216,6 +263,7 @@ fn sdv_https_target_over_https_proxy() {
             return Err(format!("unexpected origin request: {req}"));
         }
         assert_header(&req, "host: foobar.com")?;
+        assert_no_header(&req, "proxy-authorization")?;
         inner
             .write_all(b"HTTP/1.1 202 OK\r\nContent-Length: 9\r\n\r\norigin ok")
             .map_err(|e| e.to_string())?;
@@ -302,6 +350,169 @@ fn sdv_https_proxy_mtls_missing_client_cert_fails() {
     let result = ylong_runtime::block_on(async move { client.request(request).await });
     assert!(result.is_err());
     proxy.finish_allow_error();
+}
+
+#[test]
+fn sdv_https_proxy_hostname_mismatch_fails() {
+    let proxy = start_proxy(|listener| {
+        let _ = accept_proxy_tls(listener, false)?;
+        Ok(())
+    });
+
+    let proxy_tls = TlsConfig::builder().ca_file(ROOT_CA).build().unwrap();
+    let client = https_proxy_client(&proxy.addr, proxy_tls).unwrap();
+    let request = RequestBuilder::new()
+        .method("GET")
+        .url("http://example.com/data")
+        .body(Body::empty())
+        .unwrap();
+
+    let result = ylong_runtime::block_on(async move { client.request(request).await });
+    assert!(result.is_err());
+    proxy.finish_allow_error();
+}
+
+#[test]
+fn sdv_https_proxy_wrong_client_cert_fails() {
+    let proxy = start_proxy(|listener| {
+        let _ = accept_proxy_tls(listener, true)?;
+        Ok(())
+    });
+
+    let proxy_tls = TlsConfig::builder()
+        .ca_file(ROOT_CA)
+        .danger_accept_invalid_hostnames(true)
+        .certificate_chain_file(INVALID_CERT)
+        .private_key_file(INVALID_KEY, TlsFileType::PEM)
+        .build()
+        .unwrap();
+    let client = https_proxy_client(&proxy.addr, proxy_tls).unwrap();
+    let request = RequestBuilder::new()
+        .method("GET")
+        .url("http://example.com/mtls")
+        .body(Body::empty())
+        .unwrap();
+
+    let result = ylong_runtime::block_on(async move { client.request(request).await });
+    assert!(result.is_err());
+    proxy.finish_allow_error();
+}
+
+#[test]
+fn sdv_https_proxy_client_cert_key_mismatch_fails() {
+    let result = TlsConfig::builder()
+        .certificate_chain_file(CERT)
+        .private_key_file(INVALID_KEY, TlsFileType::PEM)
+        .build();
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn sdv_https_proxy_tls_version_mismatch_fails() {
+    let proxy = start_proxy(|listener| {
+        let acceptor = tls_acceptor_config(
+            false,
+            CERT,
+            KEY,
+            Some(SslVersion::TLS1_3),
+            Some(SslVersion::TLS1_3),
+            None,
+        )?;
+        let _ = accept_proxy_tls_with_acceptor(listener, acceptor)?;
+        Ok(())
+    });
+
+    let proxy_tls = TlsConfig::builder()
+        .ca_file(ROOT_CA)
+        .danger_accept_invalid_hostnames(true)
+        .max_proto_version(TlsVersion::TLS_1_2)
+        .build()
+        .unwrap();
+    let client = https_proxy_client(&proxy.addr, proxy_tls).unwrap();
+    let request = RequestBuilder::new()
+        .method("GET")
+        .url("http://example.com/data")
+        .body(Body::empty())
+        .unwrap();
+
+    let result = ylong_runtime::block_on(async move { client.request(request).await });
+    assert!(result.is_err());
+    proxy.finish_allow_error();
+}
+
+#[test]
+fn sdv_https_proxy_tls_cipher_mismatch_fails() {
+    let proxy = start_proxy(|listener| {
+        let acceptor = tls_acceptor_config(
+            false,
+            CERT,
+            KEY,
+            Some(SslVersion::TLS1_3),
+            Some(SslVersion::TLS1_3),
+            Some("TLS_AES_256_GCM_SHA384"),
+        )?;
+        let _ = accept_proxy_tls_with_acceptor(listener, acceptor)?;
+        Ok(())
+    });
+
+    let proxy_tls = TlsConfig::builder()
+        .ca_file(ROOT_CA)
+        .danger_accept_invalid_hostnames(true)
+        .min_proto_version(TlsVersion::TLS_1_3)
+        .max_proto_version(TlsVersion::TLS_1_3)
+        .cipher_suite("TLS_AES_128_GCM_SHA256")
+        .build()
+        .unwrap();
+    let client = https_proxy_client(&proxy.addr, proxy_tls).unwrap();
+    let request = RequestBuilder::new()
+        .method("GET")
+        .url("http://example.com/data")
+        .body(Body::empty())
+        .unwrap();
+
+    let result = ylong_runtime::block_on(async move { client.request(request).await });
+    assert!(result.is_err());
+    proxy.finish_allow_error();
+}
+
+#[test]
+fn sdv_insecure_proxy_verify_does_not_disable_origin_verify() {
+    let proxy = start_proxy(|listener| {
+        let acceptor = tls_acceptor_config(false, INVALID_CERT, INVALID_KEY, None, None, None)?;
+        let mut outer = accept_proxy_tls_with_acceptor(listener, acceptor)?;
+        let connect = read_headers(&mut outer)?;
+        if !connect.starts_with("CONNECT foobar.com:443 HTTP/1.1\r\n") {
+            return Err(format!("unexpected CONNECT request: {connect}"));
+        }
+        outer
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .map_err(|e| e.to_string())?;
+
+        let acceptor = tls_acceptor(false)?;
+        let _ = acceptor.accept(outer);
+        Ok(())
+    });
+
+    let proxy_tls = TlsConfig::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .unwrap();
+    let proxy_config = Proxy::all(format!("https://{}", proxy.addr).as_str())
+        .proxy_tls_config(proxy_tls)
+        .build()
+        .unwrap();
+    let client = Client::builder().proxy(proxy_config).build().unwrap();
+    let request = RequestBuilder::new()
+        .method("GET")
+        .url("https://foobar.com/data")
+        .body(Body::empty())
+        .unwrap();
+
+    let result = ylong_runtime::block_on(async move { client.request(request).await });
+    assert!(result.is_err());
+    proxy.finish();
 }
 
 #[test]
