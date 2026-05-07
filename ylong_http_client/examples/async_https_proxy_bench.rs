@@ -143,7 +143,9 @@ fn build_client(config: &Config) -> Result<ylong_http_client::async_impl::Client
         proxy = proxy.basic_auth(username, password);
     }
 
-    let mut builder = ClientBuilder::new().proxy(proxy.build()?);
+    let mut builder = ClientBuilder::new()
+        .proxy(proxy.build()?)
+        .max_h1_conn_number(config.concurrency);
     if let Some(path) = &config.origin_ca_file {
         builder = builder.tls_ca_file(path);
     }
