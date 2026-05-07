@@ -15,7 +15,20 @@ tools/https_proxy_bench/run_https_proxy_bench.sh \
   --concurrency 64
 ```
 
-The runner builds `async_https_proxy_bench`, compiles `libcurl_harness.c` when `curl-config` and `cc` are available, and prints one JSON metrics line per client.
+The runner builds `async_https_proxy_bench`, compiles `libcurl_harness.c` when `curl-config` and `cc` are available, prints one JSON environment line, then prints one JSON metrics line per client run. Set `REPEAT=5` to run both clients five times with the same workload.
+
+POST upload workloads use the same flags for both clients:
+
+```bash
+REPEAT=5 tools/https_proxy_bench/run_https_proxy_bench.sh \
+  --url http://127.0.0.1:18080/ \
+  --proxy https://localhost:18443 \
+  --proxy-ca-file target/https_proxy_bench/certs/ca.pem \
+  --method POST \
+  --body-size 1048576 \
+  --requests 10000 \
+  --concurrency 64
+```
 
 ## Local Fixture
 
@@ -64,4 +77,4 @@ PROFILE=time tools/https_proxy_bench/run_https_proxy_bench.sh ...
 PROFILE=perf-stat tools/https_proxy_bench/run_https_proxy_bench.sh ...
 ```
 
-Primary metrics are requests/sec, P50/P95/P99 latency, errors, and CPU counters from the selected profiler. The contest target is met when `ylong_http_client` throughput is at least 20% higher than libcurl for the same proxy, origin, response size, request count, concurrency, and TLS verification settings.
+Primary metrics are requests/sec, P50/P90/P95/P99 latency, errors, and CPU counters from the selected profiler. The contest target is met when `ylong_http_client` throughput is at least 20% higher than libcurl for the same proxy, origin, method, body size, response size, request count, concurrency, and TLS verification settings. For formal runs, use `REPEAT=5`; at least four runs should meet the 20% throughput target and ylong's error rate must not exceed libcurl's.

@@ -15,6 +15,8 @@ usage: tools/https_proxy_bench/run_https_proxy_bench.sh --url URL --proxy https:
 Common options forwarded to both clients:
   --requests N
   --concurrency N
+  --method GET|POST
+  --body-size N
   --proxy-ca-file PEM
   --proxy-client-cert PEM
   --proxy-client-key PEM
@@ -24,6 +26,7 @@ Common options forwarded to both clients:
   --proxy-user-pass user:pass
 
 Profiling:
+  REPEAT=N          run each client N times
   PROFILE=time      run each client under /usr/bin/time -v when available
   PROFILE=perf-stat run each client under perf stat when available
 USAGE
@@ -66,10 +69,47 @@ case "${PROFILE:-}" in
         ;;
 esac
 
-echo "== ylong_http_client =="
-"${prefix[@]}" "$YLONG_BIN" "$@"
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+version_of() {
+    local command="$1"
+    shift
+    if command -v "$command" >/dev/null 2>&1; then
+        "$command" "$@" 2>/dev/null | head -n 1
+    else
+        printf 'unavailable'
+    fi
+}
+
+REPEAT="${REPEAT:-1}"
+if ! [[ "$REPEAT" =~ ^[0-9]+$ ]] || [[ "$REPEAT" -eq 0 ]]; then
+    echo "REPEAT must be a positive integer" >&2
+    exit 2
+fi
+
+printf '{"kind":"bench_environment","repeat":%s,' "$REPEAT"
+printf '"git":"%s",' "$(json_escape "$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || printf unavailable)")"
+printf '"rustc":"%s",' "$(json_escape "$(version_of rustc --version)")"
+printf '"cargo":"%s",' "$(json_escape "$(version_of cargo --version)")"
+printf '"curl":"%s",' "$(json_escape "$(version_of curl --version)")"
+printf '"openssl":"%s",' "$(json_escape "$(version_of openssl version)")"
+printf '"uname":"%s"}\n' "$(json_escape "$(uname -a 2>/dev/null || printf unavailable)")"
+
+run_repeated() {
+    local name="$1"
+    local bin="$2"
+    shift 2
+    local run
+    for run in $(seq 1 "$REPEAT"); do
+        echo "== ${name} run ${run}/${REPEAT} =="
+        "${prefix[@]}" "$bin" "$@"
+    done
+}
+
+run_repeated "ylong_http_client" "$YLONG_BIN" "$@"
 
 if [[ -n "$CURL_BIN" ]]; then
-    echo "== libcurl =="
-    "${prefix[@]}" "$CURL_BIN" "$@"
+    run_repeated "libcurl" "$CURL_BIN" "$@"
 fi

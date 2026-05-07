@@ -26,6 +26,21 @@ class OriginHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+        body = b"x" * self.response_size
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, fmt, *args):
         return
 
@@ -52,7 +67,7 @@ class HttpsProxyServer(socketserver.ThreadingTCPServer):
 class ProxyHandler(socketserver.BaseRequestHandler):
     def handle(self):
         while True:
-            header = self._read_header()
+            header, rest = self._read_header()
             if not header:
                 return
             first, headers = header.split(b"\r\n", 1)
@@ -63,6 +78,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             if method.upper() == "CONNECT":
                 self._connect(target, version)
                 return
+            self._drain_request_body(headers, rest)
             self._direct_http_response(version)
 
     def _read_header(self):
@@ -70,11 +86,12 @@ class ProxyHandler(socketserver.BaseRequestHandler):
         while b"\r\n\r\n" not in data:
             chunk = self.request.recv(4096)
             if not chunk:
-                return bytes(data)
+                return bytes(data), b""
             data.extend(chunk)
             if len(data) > 65536:
-                return b""
-        return bytes(data)
+                return b"", b""
+        marker = data.index(b"\r\n\r\n") + 4
+        return bytes(data[:marker]), bytes(data[marker:])
 
     def _direct_http_response(self, version):
         body = b"x" * self.server.response_size
@@ -85,6 +102,23 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             "\r\n"
         ).encode("ascii") + body
         self.request.sendall(response)
+
+    def _drain_request_body(self, headers, rest):
+        length = 0
+        for line in headers.split(b"\r\n"):
+            name, _, value = line.partition(b":")
+            if name.lower() == b"content-length":
+                try:
+                    length = int(value.strip())
+                except ValueError:
+                    length = 0
+                break
+        length = max(0, length - len(rest))
+        while length > 0:
+            data = self.request.recv(min(length, 64 * 1024))
+            if not data:
+                return
+            length -= len(data)
 
     def _connect(self, target, version):
         host, port = split_host_port(target)

@@ -14,6 +14,7 @@
 typedef struct {
     const char *url;
     const char *proxy;
+    const char *method;
     const char *proxy_ca_file;
     const char *proxy_client_cert;
     const char *proxy_client_key;
@@ -23,6 +24,7 @@ typedef struct {
     long insecure_origin;
     size_t requests;
     size_t concurrency;
+    size_t body_size;
 } Config;
 
 typedef struct {
@@ -30,6 +32,8 @@ typedef struct {
     size_t start;
     size_t count;
     uint64_t *latencies_us;
+    char *body;
+    struct curl_slist *headers;
     uint64_t bytes;
     size_t completed;
     size_t errors;
@@ -78,6 +82,14 @@ static void set_common_options(CURL *curl, Worker *worker)
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &worker->bytes);
 
+    if (strcmp(config->method, "POST") == 0) {
+        worker->headers = curl_slist_append(worker->headers, "Expect:");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, worker->headers);
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)config->body_size);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, worker->body);
+    }
+
     if (config->proxy_ca_file != NULL) {
         curl_easy_setopt(curl, CURLOPT_PROXY_CAINFO, config->proxy_ca_file);
     }
@@ -112,6 +124,16 @@ static void *run_worker(void *arg)
         return NULL;
     }
 
+    if (strcmp(worker->config->method, "POST") == 0 && worker->config->body_size > 0) {
+        worker->body = malloc(worker->config->body_size);
+        if (worker->body == NULL) {
+            worker->errors += worker->count;
+            curl_easy_cleanup(curl);
+            return NULL;
+        }
+        memset(worker->body, 'x', worker->config->body_size);
+    }
+
     set_common_options(curl, worker);
 
     for (size_t i = 0; i < worker->count; i++) {
@@ -126,6 +148,8 @@ static void *run_worker(void *arg)
     }
 
     curl_easy_cleanup(curl);
+    curl_slist_free_all(worker->headers);
+    free(worker->body);
     return NULL;
 }
 
@@ -145,7 +169,8 @@ static void usage(const char *program)
             "usage: %s --url URL --proxy https://PROXY[:PORT] [--requests N] "
             "[--concurrency N] [--proxy-ca-file PEM] [--proxy-client-cert PEM] "
             "[--proxy-client-key PEM] [--origin-ca-file PEM] [--insecure-proxy] "
-            "[--insecure-origin] [--proxy-user-pass user:pass]\n",
+            "[--insecure-origin] [--proxy-user-pass user:pass] [--method GET|POST] "
+            "[--body-size N]\n",
             program);
 }
 
@@ -155,6 +180,7 @@ static Config parse_args(int argc, char **argv)
     memset(&config, 0, sizeof(config));
     config.requests = 1000;
     config.concurrency = 16;
+    config.method = "GET";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--url") == 0) {
@@ -165,6 +191,10 @@ static Config parse_args(int argc, char **argv)
             config.requests = strtoull(next_value(&i, argc, argv, "--requests"), NULL, 10);
         } else if (strcmp(argv[i], "--concurrency") == 0) {
             config.concurrency = strtoull(next_value(&i, argc, argv, "--concurrency"), NULL, 10);
+        } else if (strcmp(argv[i], "--method") == 0) {
+            config.method = next_value(&i, argc, argv, "--method");
+        } else if (strcmp(argv[i], "--body-size") == 0) {
+            config.body_size = strtoull(next_value(&i, argc, argv, "--body-size"), NULL, 10);
         } else if (strcmp(argv[i], "--proxy-ca-file") == 0) {
             config.proxy_ca_file = next_value(&i, argc, argv, "--proxy-ca-file");
         } else if (strcmp(argv[i], "--proxy-client-cert") == 0) {
@@ -192,6 +222,14 @@ static Config parse_args(int argc, char **argv)
     if (config.url == NULL || config.proxy == NULL || config.requests == 0 ||
         config.concurrency == 0) {
         usage(argv[0]);
+        exit(2);
+    }
+    if (strcmp(config.method, "GET") != 0 && strcmp(config.method, "POST") != 0) {
+        fprintf(stderr, "--method must be GET or POST\n");
+        exit(2);
+    }
+    if (strcmp(config.method, "GET") == 0 && config.body_size != 0) {
+        fprintf(stderr, "--body-size is only supported with --method POST\n");
         exit(2);
     }
     return config;
@@ -249,13 +287,15 @@ int main(int argc, char **argv)
     double elapsed_ms = (double)elapsed_us / 1000.0;
     double rps = elapsed_us == 0 ? 0.0 : (double)completed * 1000000.0 / (double)elapsed_us;
 
-    printf("{\"client\":\"libcurl\",\"url\":\"%s\",\"proxy\":\"%s\",\"requests\":%zu,"
-           "\"completed\":%zu,\"errors\":%zu,\"concurrency\":%zu,\"bytes\":%llu,"
+    printf("{\"client\":\"libcurl\",\"url\":\"%s\",\"proxy\":\"%s\",\"method\":\"%s\","
+           "\"body_size\":%zu,\"requests\":%zu,\"completed\":%zu,\"errors\":%zu,"
+           "\"concurrency\":%zu,\"bytes\":%llu,"
            "\"elapsed_ms\":%.3f,\"rps\":%.3f,\"latency_us_p50\":%llu,"
-           "\"latency_us_p95\":%llu,\"latency_us_p99\":%llu}\n",
-           config.url, config.proxy, config.requests, completed, errors,
-           config.concurrency, (unsigned long long)bytes, elapsed_ms, rps,
+           "\"latency_us_p90\":%llu,\"latency_us_p95\":%llu,\"latency_us_p99\":%llu}\n",
+           config.url, config.proxy, config.method, config.body_size, config.requests,
+           completed, errors, config.concurrency, (unsigned long long)bytes, elapsed_ms, rps,
            (unsigned long long)percentile(latencies, completed, 50),
+           (unsigned long long)percentile(latencies, completed, 90),
            (unsigned long long)percentile(latencies, completed, 95),
            (unsigned long long)percentile(latencies, completed, 99));
 

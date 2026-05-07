@@ -30,6 +30,8 @@ struct Config {
     proxy: String,
     requests: usize,
     concurrency: usize,
+    method: String,
+    body_size: usize,
     proxy_ca_file: Option<String>,
     proxy_client_cert: Option<String>,
     proxy_client_key: Option<String>,
@@ -64,8 +66,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let count = requests_for_worker(config.requests, config.concurrency, worker);
         let client = client.clone();
         let url = config.url.clone();
+        let method = config.method.clone();
+        let body_size = config.body_size;
         handles.push(tokio::spawn(
-            async move { run_worker(client, url, count).await },
+            async move { run_worker(client, url, method, body_size, count).await },
         ));
     }
 
@@ -90,9 +94,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(
-        "{{\"client\":\"ylong_http_client\",\"url\":\"{}\",\"proxy\":\"{}\",\"requests\":{},\"completed\":{},\"errors\":{},\"concurrency\":{},\"bytes\":{},\"elapsed_ms\":{:.3},\"rps\":{:.3},\"latency_us_p50\":{},\"latency_us_p95\":{},\"latency_us_p99\":{}}}",
+        "{{\"client\":\"ylong_http_client\",\"url\":\"{}\",\"proxy\":\"{}\",\"method\":\"{}\",\"body_size\":{},\"requests\":{},\"completed\":{},\"errors\":{},\"concurrency\":{},\"bytes\":{},\"elapsed_ms\":{:.3},\"rps\":{:.3},\"latency_us_p50\":{},\"latency_us_p90\":{},\"latency_us_p95\":{},\"latency_us_p99\":{}}}",
         escape_json(&config.url),
         escape_json(&config.proxy),
+        escape_json(&config.method),
+        config.body_size,
         config.requests,
         completed,
         errors,
@@ -101,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         elapsed_ms,
         rps,
         percentile(&latencies, 50),
+        percentile(&latencies, 90),
         percentile(&latencies, 95),
         percentile(&latencies, 99),
     );
@@ -151,6 +158,8 @@ fn build_client(config: &Config) -> Result<ylong_http_client::async_impl::Client
 async fn run_worker(
     client: Arc<ylong_http_client::async_impl::Client>,
     url: String,
+    method: String,
+    body_size: usize,
     count: usize,
 ) -> WorkerResult {
     let mut result = WorkerResult {
@@ -161,7 +170,7 @@ async fn run_worker(
 
     for _ in 0..count {
         let started = Instant::now();
-        match request_once(&client, &url).await {
+        match request_once(&client, &url, &method, body_size).await {
             Ok(bytes) => {
                 result.latencies_us.push(started.elapsed().as_micros());
                 result.bytes += bytes;
@@ -176,8 +185,15 @@ async fn run_worker(
 async fn request_once(
     client: &ylong_http_client::async_impl::Client,
     url: &str,
+    method: &str,
+    body_size: usize,
 ) -> Result<u64, HttpClientError> {
-    let request = Request::builder().url(url).body(Body::empty())?;
+    let body = if method == "POST" {
+        Body::slice(vec![b'x'; body_size])
+    } else {
+        Body::empty()
+    };
+    let request = Request::builder().method(method).url(url).body(body)?;
     let mut response = client.request(request).await?;
     if !response.status().is_successful() {
         return Err(HttpClientError::other(std::io::Error::new(
@@ -225,6 +241,8 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
         proxy: String::new(),
         requests: 1000,
         concurrency: 16,
+        method: "GET".to_string(),
+        body_size: 0,
         proxy_ca_file: None,
         proxy_client_cert: None,
         proxy_client_key: None,
@@ -245,6 +263,11 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
             "--concurrency" => {
                 config.concurrency =
                     parse_usize(&next_value(&mut iter, "--concurrency")?, "--concurrency")?
+            }
+            "--method" => config.method = next_value(&mut iter, "--method")?.to_ascii_uppercase(),
+            "--body-size" => {
+                config.body_size =
+                    parse_usize(&next_value(&mut iter, "--body-size")?, "--body-size")?
             }
             "--proxy-ca-file" => {
                 config.proxy_ca_file = Some(next_value(&mut iter, "--proxy-ca-file")?)
@@ -280,6 +303,12 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
     if config.concurrency == 0 {
         return Err("--concurrency must be greater than 0".to_string());
     }
+    if config.method != "GET" && config.method != "POST" {
+        return Err("--method must be GET or POST".to_string());
+    }
+    if config.method == "GET" && config.body_size != 0 {
+        return Err("--body-size is only supported with --method POST".to_string());
+    }
 
     Ok(config)
 }
@@ -311,5 +340,5 @@ fn escape_json(value: &str) -> String {
 }
 
 fn usage() -> &'static str {
-    "usage: async_https_proxy_bench --url URL --proxy https://PROXY[:PORT] [--requests N] [--concurrency N] [--proxy-ca-file PEM] [--proxy-client-cert PEM] [--proxy-client-key PEM] [--origin-ca-file PEM] [--insecure-proxy] [--insecure-origin] [--proxy-user-pass user:pass]"
+    "usage: async_https_proxy_bench --url URL --proxy https://PROXY[:PORT] [--requests N] [--concurrency N] [--method GET|POST] [--body-size N] [--proxy-ca-file PEM] [--proxy-client-cert PEM] [--proxy-client-key PEM] [--origin-ca-file PEM] [--insecure-proxy] [--insecure-origin] [--proxy-user-pass user:pass]"
 }
