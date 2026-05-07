@@ -27,10 +27,13 @@ use crate::c_openssl::x509::{X509Store, X509StoreRef};
 use crate::util::c_openssl::error::ErrorStack;
 #[cfg(feature = "__c_openssl")]
 use crate::util::c_openssl::ffi::ssl::SSL_CTX_ctrl;
+#[cfg(feature = "__c_openssl")]
+use crate::util::c_openssl::ffi::ssl::SSL_CTX_set_ciphersuites;
 use crate::util::c_openssl::ffi::ssl::{
-    SSL_CTX_load_verify_locations, SSL_CTX_new, SSL_CTX_set_alpn_protos, SSL_CTX_set_cert_store,
-    SSL_CTX_set_cert_verify_callback, SSL_CTX_set_cipher_list, SSL_CTX_up_ref,
-    SSL_CTX_use_certificate_chain_file, SSL_CTX_use_certificate_file, SSL_CTX,
+    SSL_CTX_check_private_key, SSL_CTX_load_verify_locations, SSL_CTX_new, SSL_CTX_set_alpn_protos,
+    SSL_CTX_set_cert_store, SSL_CTX_set_cert_verify_callback, SSL_CTX_set_cipher_list,
+    SSL_CTX_up_ref, SSL_CTX_use_PrivateKey_file, SSL_CTX_use_certificate_chain_file,
+    SSL_CTX_use_certificate_file, SSL_CTX,
 };
 #[cfg(feature = "c_boringssl")]
 use crate::util::c_openssl::ffi::ssl::{
@@ -190,6 +193,18 @@ impl SslContextBuilder {
         check_ret(unsafe { SSL_CTX_set_cipher_list(ptr, list.as_ptr() as *const _) }).map(|_| ())
     }
 
+    /// Sets the list of supported ciphersuites for `TLSv1.3`.
+    #[cfg(feature = "__c_openssl")]
+    pub(crate) fn set_cipher_suite(&mut self, list: &str) -> Result<(), ErrorStack> {
+        let list = match CString::new(list) {
+            Ok(cstr) => cstr,
+            Err(_) => return Err(ErrorStack::get()),
+        };
+        let ptr = self.as_ptr_mut();
+
+        check_ret(unsafe { SSL_CTX_set_ciphersuites(ptr, list.as_ptr() as *const _) }).map(|_| ())
+    }
+
     /// Loads a leaf certificate from a file.
     ///
     /// Only a single certificate will be loaded - use `add_extra_chain_cert` to
@@ -210,6 +225,28 @@ impl SslContextBuilder {
             SSL_CTX_use_certificate_file(ptr, file.as_ptr() as *const _, file_type.as_raw())
         })
         .map(|_| ())
+    }
+
+    /// Loads a private key from a file.
+    pub(crate) fn set_private_key_file<P>(
+        &mut self,
+        file: P,
+        file_type: SslFiletype,
+    ) -> Result<(), ErrorStack>
+    where
+        P: AsRef<Path>,
+    {
+        let file = Self::get_c_file(file)?;
+        let ptr = self.as_ptr_mut();
+        check_ret(unsafe {
+            SSL_CTX_use_PrivateKey_file(ptr, file.as_ptr() as *const _, file_type.as_raw())
+        })
+        .map(|_| ())
+    }
+
+    pub(crate) fn check_private_key(&mut self) -> Result<(), ErrorStack> {
+        let ptr = self.as_ptr_mut();
+        check_ret(unsafe { SSL_CTX_check_private_key(ptr) }).map(|_| ())
     }
 
     /// Loads a certificate chain from file into ctx.

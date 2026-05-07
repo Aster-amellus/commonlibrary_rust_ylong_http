@@ -47,6 +47,7 @@ pub struct TlsConfigBuilder {
     certs_list: Vec<Cert>,
     pins: Option<PubKeyPins>,
     paths_list: Vec<String>,
+    check_private_key: bool,
 }
 
 impl TlsConfigBuilder {
@@ -68,6 +69,7 @@ impl TlsConfigBuilder {
             certs_list: vec![],
             pins: None,
             paths_list: vec![],
+            check_private_key: false,
         }
     }
 
@@ -153,6 +155,26 @@ impl TlsConfigBuilder {
         self
     }
 
+    /// Sets the list of supported ciphersuites for `TLSv1.3`.
+    ///
+    /// See OpenSSL's `SSL_CTX_set_ciphersuites` for details on the format.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ylong_http_client::TlsConfigBuilder;
+    ///
+    /// let builder = TlsConfigBuilder::new()
+    ///     .cipher_suite("TLS_AES_256_GCM_SHA384");
+    /// ```
+    #[cfg(feature = "__c_openssl")]
+    pub fn cipher_suite(mut self, list: &str) -> Self {
+        self.inner = self
+            .inner
+            .and_then(|mut builder| builder.set_cipher_suite(list).map(|_| builder));
+        self
+    }
+
     /// Loads a leaf certificate from a file.
     ///
     /// Only a single certificate will be loaded - use `add_extra_chain_cert` to
@@ -173,6 +195,28 @@ impl TlsConfigBuilder {
                 .set_certificate_file(path, file_type.into_inner())
                 .map(|_| builder)
         });
+        self
+    }
+
+    /// Loads a private key from a file.
+    ///
+    /// Use this together with `certificate_file` or `certificate_chain_file`
+    /// when a TLS peer requires client certificate authentication.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ylong_http_client::{TlsConfigBuilder, TlsFileType};
+    ///
+    /// let builder = TlsConfigBuilder::new().private_key_file("key.pem", TlsFileType::PEM);
+    /// ```
+    pub fn private_key_file<T: AsRef<Path>>(mut self, path: T, file_type: TlsFileType) -> Self {
+        self.inner = self.inner.and_then(|mut builder| {
+            builder
+                .set_private_key_file(path, file_type.into_inner())
+                .map(|_| builder)
+        });
+        self.check_private_key = true;
         self
     }
 
@@ -377,6 +421,12 @@ impl TlsConfigBuilder {
                     .and_then(|store| store.add_path(path))
                     .map(|_| builder)
             });
+        }
+
+        if self.check_private_key {
+            self.inner = self
+                .inner
+                .and_then(|mut builder| builder.check_private_key().map(|_| builder));
         }
 
         let ctx = self
@@ -704,6 +754,21 @@ mod ut_openssl_adapter {
         assert!(builder.is_ok());
     }
 
+    /// UT test cases for `TlsConfigBuilder::set_cipher_suite`.
+    ///
+    /// # Brief
+    /// 1. Creates a `TlsConfigBuilder` by calling `TlsConfigBuilder::new`.
+    /// 2. Calls `set_cipher_suite`.
+    /// 3. Checks if the result is as expected.
+    #[cfg(feature = "__c_openssl")]
+    #[test]
+    fn ut_set_cipher_suite() {
+        let builder = TlsConfigBuilder::new()
+            .cipher_suite("TLS_AES_256_GCM_SHA384")
+            .build();
+        assert!(builder.is_ok());
+    }
+
     /// UT test cases for `TlsConfigBuilder::set_certificate_file`.
     ///
     /// # Brief
@@ -732,6 +797,21 @@ mod ut_openssl_adapter {
             .certificate_chain_file("cert.pem")
             .build();
         assert!(builder.is_err());
+    }
+
+    /// UT test cases for `TlsConfigBuilder::set_private_key_file`.
+    ///
+    /// # Brief
+    /// 1. Creates a `TlsConfigBuilder` by calling `TlsConfigBuilder::new`.
+    /// 2. Loads a matching certificate chain and private key.
+    /// 3. Checks if the result is as expected.
+    #[test]
+    fn ut_set_private_key_file() {
+        let builder = TlsConfigBuilder::new()
+            .certificate_chain_file("tests/file/cert.pem")
+            .private_key_file("tests/file/key.pem", TlsFileType::PEM)
+            .build();
+        assert!(builder.is_ok());
     }
 
     /// UT test cases for `TlsConfigBuilder::add_root_certificates`.
