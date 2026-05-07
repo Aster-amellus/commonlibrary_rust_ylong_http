@@ -89,6 +89,11 @@ pub(crate) mod runtime {
         task::{spawn_blocking, JoinHandle},
         time::{sleep, timeout, Sleep},
     };
+    #[cfg(all(feature = "tokio_base", not(feature = "async")))]
+    pub(crate) use tokio::{
+        sync::{OwnedSemaphorePermit as SemaphorePermit, Semaphore},
+        time::{sleep, Sleep},
+    };
     #[cfg(feature = "ylong_base")]
     pub(crate) use ylong_runtime::{
         futures::poll_fn,

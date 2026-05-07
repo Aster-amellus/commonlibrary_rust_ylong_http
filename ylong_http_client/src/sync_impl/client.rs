@@ -311,6 +311,7 @@ impl ClientBuilder {
     pub fn build(self) -> Result<Client<HttpConnector>, HttpClientError> {
         let config = ConnectorConfig {
             proxies: self.proxies,
+            timeout: self.client.connect_timeout.clone(),
             #[cfg(feature = "__tls")]
             tls: self.tls.build()?,
         };
