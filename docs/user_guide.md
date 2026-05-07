@@ -66,9 +66,86 @@ async fn create_client_with_builder() {
 - `add_root_certificate`: 设置根证书
 - `min_tls_version`: 设置 TLS 版本下限
 - `max_tls_version`: 设置 TLS 版本上限
-- `set_cipher_suite`: 设置 TLSv1.3 的算法套件
-- `set_cipher_list`: 设置 TLSv1.3 之前版本的算法套件
-- `set_ca_file`: 设置 CA 证书文件路径
+- `tls_cipher_suite`: 设置 TLSv1.3 的算法套件
+- `tls_cipher_list`: 设置 TLSv1.3 之前版本的算法套件
+- `tls_ca_file`: 设置 CA 证书文件路径
+
+#### 配置 HTTPS 代理
+
+`Proxy::http`、`Proxy::https`、`Proxy::all` 表示匹配哪些目标请求走代理；代理服务器自身是否使用 TLS 由代理 URL 的 scheme 决定。
+
+```rust
+use ylong_http_client::async_impl::{Body, ClientBuilder, Request};
+use ylong_http_client::{HttpClientError, Proxy};
+
+async fn request_with_https_proxy() -> Result<(), HttpClientError> {
+    let proxy = Proxy::all("https://proxy.example.com:8443")
+        .basic_auth("user", "password")
+        .build()?;
+
+    let client = ClientBuilder::new().proxy(proxy).build()?;
+    let request = Request::builder()
+        .url("http://www.example.com/data")
+        .body(Body::empty())?;
+
+    let _response = client.request(request).await?;
+    Ok(())
+}
+```
+
+如果代理服务器使用自签名证书、私有 CA、或要求客户端证书认证，可以为代理单独设置 TLS 配置：
+
+```rust
+use ylong_http_client::async_impl::ClientBuilder;
+use ylong_http_client::{HttpClientError, Proxy, TlsConfig, TlsFileType};
+
+fn client_with_proxy_mtls() -> Result<ylong_http_client::async_impl::Client, HttpClientError> {
+    let proxy_tls = TlsConfig::builder()
+        .ca_file("proxy-ca.pem")
+        .certificate_chain_file("client-chain.pem")
+        .private_key_file("client-key.pem", TlsFileType::PEM)
+        .cipher_list("DEFAULT:!aNULL:!eNULL")
+        .cipher_suite("TLS_AES_256_GCM_SHA384")
+        .build()?;
+
+    let proxy = Proxy::all("https://proxy.example.com:8443")
+        .proxy_tls_config(proxy_tls)
+        .build()?;
+
+    ClientBuilder::new().proxy(proxy).build()
+}
+```
+
+代理 TLS 配置只用于连接代理服务器，不影响最终目标服务器的 TLS 配置。最终目标服务器的 TLS 仍通过 `ClientBuilder` 上的 `tls_ca_file`、`add_root_certificate`、`min_tls_version`、`max_tls_version` 等接口配置。
+
+同步客户端使用相同的 `Proxy` 和 `TlsConfig` API：
+
+```rust
+use ylong_http_client::sync_impl::{ClientBuilder, Request};
+use ylong_http_client::{HttpClientError, Proxy, TlsConfig};
+
+fn sync_request_with_https_proxy() -> Result<(), HttpClientError> {
+    let proxy_tls = TlsConfig::builder().ca_file("proxy-ca.pem").build()?;
+    let proxy = Proxy::all("https://proxy.example.com:8443")
+        .proxy_tls_config(proxy_tls)
+        .build()?;
+
+    let client = ClientBuilder::new().proxy(proxy).build()?;
+    let request = Request::builder()
+        .url("https://www.example.com")
+        .body("".as_bytes())?;
+
+    let _response = client.request(request)?;
+    Ok(())
+}
+```
+
+HTTPS 代理能力需要启用 TLS feature，例如：
+
+```bash
+cargo test -p ylong_http_client --features "async http1_1 ylong_base c_openssl_3_0" --test sdv_async_https_proxy
+cargo test -p ylong_http_client --features "sync http1_1 tokio_base c_openssl_3_0" --test sdv_sync_https_proxy
+```
 
 #### 创建请求
 
