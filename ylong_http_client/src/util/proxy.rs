@@ -15,6 +15,7 @@
 
 use core::convert::TryFrom;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ylong_http::headers::HeaderValue;
 use ylong_http::request::uri::{Authority, Scheme, Uri};
@@ -22,6 +23,9 @@ use ylong_http::request::uri::{Authority, Scheme, Uri};
 use crate::error::HttpClientError;
 use crate::util::base64::encode;
 use crate::util::normalizer::UriFormatter;
+use crate::util::pool::PoolKey;
+
+static NEXT_PROXY_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// `Proxies` is responsible for managing a list of proxies.
 #[derive(Clone, Default)]
@@ -36,6 +40,16 @@ impl Proxies {
 
     pub(crate) fn match_proxy(&self, uri: &Uri) -> Option<&Proxy> {
         self.list.iter().find(|proxy| proxy.is_intercepted(uri))
+    }
+
+    pub(crate) fn pool_key(&self, uri: &Uri) -> PoolKey {
+        match self.match_proxy(uri) {
+            Some(proxy) => proxy.pool_key(uri),
+            None => PoolKey::new(
+                uri.scheme().unwrap().clone(),
+                uri.authority().unwrap().clone(),
+            ),
+        }
     }
 }
 
@@ -124,6 +138,17 @@ impl Proxy {
             Intercept::Https(_) => !no_proxy && *uri.scheme().unwrap() == Scheme::HTTPS,
         }
     }
+
+    fn pool_key(&self, uri: &Uri) -> PoolKey {
+        let info = self.intercept.proxy_info();
+        PoolKey::proxied(
+            uri.scheme().unwrap().clone(),
+            uri.authority().unwrap().clone(),
+            info.pool_key_id(),
+            info.scheme().clone(),
+            info.authority().clone(),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -146,6 +171,7 @@ impl Intercept {
 /// ProxyInfo which contains authentication, scheme and host.
 #[derive(Clone)]
 pub(crate) struct ProxyInfo {
+    pool_key_id: u64,
     pub(crate) scheme: Scheme,
     pub(crate) authority: Authority,
     pub(crate) basic_auth: Option<HeaderValue>,
@@ -166,6 +192,7 @@ impl ProxyInfo {
         let (scheme, authority, _, _) = uri.into_parts();
         // `scheme` and `authority` must have values after formatting.
         Ok(Self {
+            pool_key_id: NEXT_PROXY_POOL_ID.fetch_add(1, Ordering::Relaxed),
             basic_auth: None,
             scheme: scheme.unwrap(),
             authority: authority.unwrap(),
@@ -180,6 +207,10 @@ impl ProxyInfo {
 
     pub(crate) fn scheme(&self) -> &Scheme {
         &self.scheme
+    }
+
+    pub(crate) fn pool_key_id(&self) -> u64 {
+        self.pool_key_id
     }
 
     #[cfg(feature = "__tls")]
@@ -348,5 +379,37 @@ mod ut_proxy {
 
         let uri = Uri::from_bytes(b"http://127.0.0.1:80").unwrap();
         assert!(proxies.match_proxy(&uri).is_none());
+    }
+
+    /// UT test cases for proxy-aware pool keys.
+    ///
+    /// # Brief
+    /// 1. Creates direct and proxied keys for the same target URI.
+    /// 2. Checks that proxy identity is part of the key.
+    /// 3. Checks that no_proxy falls back to the direct key.
+    #[test]
+    fn ut_proxy_pool_key() {
+        let uri = Uri::from_bytes(b"http://www.example.com/path").unwrap();
+        let direct = Proxies::default().pool_key(&uri);
+
+        let mut proxies_a = Proxies::default();
+        proxies_a.add_proxy(Proxy::all("https://proxy.example.com:8443").unwrap());
+        let proxied_a = proxies_a.pool_key(&uri);
+
+        let mut proxies_b = Proxies::default();
+        proxies_b.add_proxy(Proxy::all("https://proxy.example.com:8443").unwrap());
+        let proxied_b = proxies_b.pool_key(&uri);
+
+        assert_ne!(direct, proxied_a);
+        assert_ne!(proxied_a, proxied_b);
+
+        let cloned = proxies_a.clone();
+        assert_eq!(proxied_a, cloned.pool_key(&uri));
+
+        let mut proxies_no_proxy = Proxies::default();
+        let mut proxy = Proxy::all("https://proxy.example.com:8443").unwrap();
+        proxy.no_proxy("www.example.com");
+        proxies_no_proxy.add_proxy(proxy);
+        assert_eq!(direct, proxies_no_proxy.pool_key(&uri));
     }
 }

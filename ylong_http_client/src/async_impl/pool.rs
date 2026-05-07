@@ -69,10 +69,7 @@ impl<C: Connector> ConnPool<C, C::Stream> {
         &self,
         uri: &Uri,
     ) -> Result<TimeInfoConn<C::Stream>, HttpClientError> {
-        let key = PoolKey::new(
-            uri.scheme().unwrap().clone(),
-            uri.authority().unwrap().clone(),
-        );
+        let key = self.connector.pool_key(uri);
 
         #[cfg(feature = "http3")]
         let alt_svc = self.alt_svcs.get_alt_svcs(&key);

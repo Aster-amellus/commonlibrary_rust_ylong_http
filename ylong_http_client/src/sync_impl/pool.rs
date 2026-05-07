@@ -38,10 +38,7 @@ impl<C: Connector> ConnPool<C, C::Stream> {
     }
 
     pub(crate) fn connect_to(&self, uri: Uri) -> Result<Conn<C::Stream>, HttpClientError> {
-        let key = PoolKey::new(
-            uri.scheme().unwrap().clone(),
-            uri.authority().unwrap().clone(),
-        );
+        let key = self.connector.pool_key(&uri);
 
         self.pool
             .get(key, |_, _| Conns::new(), 0, SpeedConfig::none())

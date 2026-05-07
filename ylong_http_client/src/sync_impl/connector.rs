@@ -16,6 +16,7 @@ use std::io::{Read, Write};
 use ylong_http::request::uri::Uri;
 
 use crate::util::config::ConnectorConfig;
+use crate::util::pool::PoolKey;
 
 /// `Connector` trait used by `Client`. `Connector` provides synchronous
 /// connection establishment interfaces.
@@ -27,6 +28,14 @@ pub trait Connector {
 
     /// Attempts to establish a synchronous connection.
     fn connect(&self, uri: &Uri) -> Result<Self::Stream, Self::Error>;
+
+    /// Returns the connection pool key for `uri`.
+    fn pool_key(&self, uri: &Uri) -> PoolKey {
+        PoolKey::new(
+            uri.scheme().unwrap().clone(),
+            uri.authority().unwrap().clone(),
+        )
+    }
 }
 
 /// Connector for creating HTTP connections synchronously.
@@ -40,6 +49,10 @@ impl HttpConnector {
     /// Creates a new `HttpConnector`.
     pub(crate) fn new(config: ConnectorConfig) -> HttpConnector {
         HttpConnector { config }
+    }
+
+    fn pool_key_for(&self, uri: &Uri) -> PoolKey {
+        self.config.proxies.pool_key(uri)
     }
 }
 
@@ -57,10 +70,15 @@ pub mod no_tls {
     use ylong_http::request::uri::Uri;
 
     use crate::sync_impl::Connector;
+    use crate::util::pool::PoolKey;
 
     impl Connector for super::HttpConnector {
         type Stream = TcpStream;
         type Error = Error;
+
+        fn pool_key(&self, uri: &Uri) -> PoolKey {
+            self.pool_key_for(uri)
+        }
 
         fn connect(&self, uri: &Uri) -> Result<Self::Stream, Self::Error> {
             let addr = if let Some(proxy) = self.config.proxies.match_proxy(uri) {
@@ -81,11 +99,16 @@ pub mod tls_conn {
 
     use crate::sync_impl::proxy::{connect_tls, tunnel};
     use crate::sync_impl::{Connector, MixStream};
+    use crate::util::pool::PoolKey;
     use crate::{ErrorKind, HttpClientError};
 
     impl Connector for super::HttpConnector {
         type Stream = MixStream<TcpStream>;
         type Error = HttpClientError;
+
+        fn pool_key(&self, uri: &Uri) -> PoolKey {
+            self.pool_key_for(uri)
+        }
 
         fn connect(&self, uri: &Uri) -> Result<Self::Stream, Self::Error> {
             // Make sure all parts of uri is accurate.

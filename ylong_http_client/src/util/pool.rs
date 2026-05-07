@@ -54,11 +54,47 @@ impl<K: Eq + Hash, V: Clone> Pool<K, V> {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub(crate) struct PoolKey(Scheme, Authority);
+pub struct PoolKey {
+    target_scheme: Scheme,
+    target_authority: Authority,
+    proxy: ProxyPoolKey,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub enum ProxyPoolKey {
+    Direct,
+    Proxied {
+        id: u64,
+        scheme: Scheme,
+        authority: Authority,
+    },
+}
 
 impl PoolKey {
     pub(crate) fn new(scheme: Scheme, authority: Authority) -> Self {
-        Self(scheme, authority)
+        Self {
+            target_scheme: scheme,
+            target_authority: authority,
+            proxy: ProxyPoolKey::Direct,
+        }
+    }
+
+    pub(crate) fn proxied(
+        target_scheme: Scheme,
+        target_authority: Authority,
+        proxy_id: u64,
+        proxy_scheme: Scheme,
+        proxy_authority: Authority,
+    ) -> Self {
+        Self {
+            target_scheme,
+            target_authority,
+            proxy: ProxyPoolKey::Proxied {
+                id: proxy_id,
+                scheme: proxy_scheme,
+                authority: proxy_authority,
+            },
+        }
     }
 }
 

@@ -30,6 +30,7 @@ use ylong_runtime::net::{ConnectedUdpSocket, UdpSocket};
 use crate::async_impl::dns::{DefaultDnsResolver, EyeBallConfig, HappyEyeballs, Resolver};
 use crate::runtime::{AsyncRead, AsyncWrite, TcpStream};
 use crate::util::config::{ConnectorConfig, HttpVersion};
+use crate::util::pool::PoolKey;
 /// Information of an IO.
 use crate::util::ConnInfo;
 use crate::{HttpClientError, Timeout};
@@ -49,6 +50,14 @@ pub trait Connector {
 
     /// Attempts to establish a connection.
     fn connect(&self, uri: &Uri, http_version: HttpVersion) -> Self::Future;
+
+    /// Returns the connection pool key for `uri`.
+    fn pool_key(&self, uri: &Uri) -> PoolKey {
+        PoolKey::new(
+            uri.scheme().unwrap().clone(),
+            uri.authority().unwrap().clone(),
+        )
+    }
 }
 
 /// Connector for creating HTTP or HTTPS connections asynchronously.
@@ -75,6 +84,10 @@ impl HttpConnector {
             config: Default::default(),
             resolver,
         }
+    }
+
+    fn pool_key_for(&self, uri: &Uri) -> PoolKey {
+        self.config.proxies.pool_key(uri)
     }
 }
 
@@ -199,12 +212,17 @@ mod no_tls {
     use crate::runtime::TcpStream;
     use crate::util::config::HttpVersion;
     use crate::util::interceptor::ConnProtocol;
+    use crate::util::pool::PoolKey;
     use crate::{ConnData, ConnDetail, HttpClientError, TimeGroup};
 
     impl Connector for HttpConnector {
         type Stream = HttpStream<TcpStream>;
         type Future =
             Pin<Box<dyn Future<Output = Result<Self::Stream, HttpClientError>> + Sync + Send>>;
+
+        fn pool_key(&self, uri: &Uri) -> PoolKey {
+            self.pool_key_for(uri)
+        }
 
         fn connect(&self, uri: &Uri, _http_version: HttpVersion) -> Self::Future {
             // Checks if this uri need be proxied.
@@ -272,6 +290,7 @@ mod tls {
     #[cfg(feature = "http2")]
     use crate::util::information::NegotiateInfo;
     use crate::util::interceptor::ConnProtocol;
+    use crate::util::pool::PoolKey;
     use crate::{ConnData, ConnDetail, HttpClientError, TimeGroup, TlsConfig};
     use core::future::Future;
     use core::pin::Pin;
@@ -284,6 +303,10 @@ mod tls {
         type Stream = HttpStream<MixStream>;
         type Future =
             Pin<Box<dyn Future<Output = Result<Self::Stream, HttpClientError>> + Sync + Send>>;
+
+        fn pool_key(&self, uri: &Uri) -> PoolKey {
+            self.pool_key_for(uri)
+        }
 
         fn connect(&self, uri: &Uri, _http_version: HttpVersion) -> Self::Future {
             // Make sure all parts of uri is accurate.
