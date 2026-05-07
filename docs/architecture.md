@@ -17,7 +17,7 @@ HTTPS 代理工作的主要边界在 `ylong_http_client`。`ylong_http` 已有 `
 flowchart TB
     App[User Application] --> Client[ylong_http_client::Client]
     Client --> Formatter[RequestFormatter]
-    Formatter --> Pool[ConnPool]
+    Formatter --> Pool[ConnPool<br/>proxy-aware PoolKey]
     Pool --> Connector[HttpConnector]
     Connector --> ProxyMatch[util::proxy::Proxies]
     Connector --> Transport[async_impl::proxy / sync_impl::proxy]
@@ -43,7 +43,7 @@ async HTTP/1.1 主路径：
 
 1. `Client::request` 接收用户请求。
 2. `RequestFormatter` 补齐 scheme、host、port、path、默认 header。
-3. `ConnPool` 按目标 URI 获取或创建连接。
+3. `ConnPool` 按目标 URI 和 proxy identity 获取或创建连接，避免跨代理配置复用。
 4. `HttpConnector` 根据目标 URI 匹配 `Proxy` 规则。
 5. 如果命中代理，Connector 根据代理 URL scheme 选择 HTTP proxy 或 HTTPS proxy transport。
 6. HTTP target over proxy 使用 absolute-form request target，并按需写入 `Proxy-Authorization`。
@@ -113,6 +113,7 @@ HTTPS proxy 必须区分两套 TLS 配置：
 
 - 代理匹配与元数据：`ylong_http_client/src/util/proxy.rs`
 - 公开配置 API：`ylong_http_client/src/util/config/settings.rs`
+- 连接池隔离：`ylong_http_client/src/util/pool.rs`，`PoolKey` 包含 target scheme/authority 和 proxy identity。
 - async proxy transport：`ylong_http_client/src/async_impl/proxy.rs`
 - async connector 编排：`ylong_http_client/src/async_impl/connector/mod.rs`
 - sync proxy transport：`ylong_http_client/src/sync_impl/proxy.rs`
@@ -120,6 +121,20 @@ HTTPS proxy 必须区分两套 TLS 配置：
 - HTTP/1.1 代理请求编码：`async_impl/conn/http1.rs`、`sync_impl/conn/http1.rs`
 
 新增代理协议时应沿此边界推进：先扩展 `ProxyInfo` 的协议元数据，再在 async/sync proxy transport 模块新增握手函数，最后由 Connector 编排目标 scheme、代理协议和 TLS 层顺序。
+
+## 测试与性能架构
+
+```mermaid
+flowchart TB
+    SDV[async/sync SDV] --> Rec[recording HTTPS proxy]
+    Rec --> Assert[request line headers CONNECT TLS isolation]
+    Bench[benchmark runner] --> Fixture[local HTTP origin + HTTPS proxy]
+    Bench --> Ylong[ylong bench client]
+    Bench --> Curl[libcurl harness]
+    Ylong --> Metrics[JSON metrics]
+    Curl --> Metrics
+    Metrics --> Compare[20%+ target report]
+```
 
 ## 已知约束
 

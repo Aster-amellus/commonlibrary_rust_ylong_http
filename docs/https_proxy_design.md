@@ -151,18 +151,18 @@ TLS stream 形态：
 
 ## 测试策略
 
-新增 SDV 测试覆盖以下能力：
+没有现成、完整、专门覆盖 HTTPS forward proxy、proxy mTLS 和 ylong_http_client API 语义的开源 test suite。项目验收采用自建 SDV 分层测试，外部套件只作为 TLS/proxy 行为参考。
 
-- async HTTP target over HTTPS proxy。
-- async HTTPS target over HTTPS proxy。
-- async HTTPS proxy mTLS 成功。
-- async HTTPS proxy 缺失客户端证书失败。
-- async HTTPS proxy 不受信 CA 失败。
-- sync HTTP target over HTTPS proxy。
-- sync HTTPS target over HTTPS proxy。
-- sync HTTPS proxy mTLS 成功。
-- sync HTTPS proxy 缺失客户端证书失败。
-- sync HTTPS proxy 不受信 CA 失败。
+当前 SDV 覆盖以下能力，async/sync 两套实现均有同构用例：
+
+| 类别 | 覆盖点 |
+| --- | --- |
+| 成功路径 | HTTP target over HTTPS proxy；HTTPS target over HTTPS proxy；proxy mTLS 成功 |
+| 代理协议字节 | HTTP target 使用 absolute-form；HTTPS target 使用 `CONNECT host:port`；CONNECT 2xx 响应中的 `Content-Length` / `Transfer-Encoding` 被忽略 |
+| 认证隔离 | `Proxy-Authorization` 出现在 proxy request / CONNECT request，不进入 tunnel 内 origin request |
+| proxy TLS 失败 | 不受信 CA；hostname mismatch；缺失 client cert；错误 client cert CA；client cert/key 不匹配；TLS version mismatch；TLS 1.3 cipher suite mismatch |
+| TLS 配置隔离 | proxy TLS 设置 `danger_accept_invalid_certs` / `danger_accept_invalid_hostnames` 时，只影响代理 TLS，不放宽 origin TLS |
+| 模块/连接池 | proxy-aware pool key 单元测试覆盖 direct/proxied/no_proxy/clone/不同 proxy identity |
 
 核心命令：
 
@@ -177,10 +177,30 @@ HTTP-only proxy 回归测试应使用非 TLS feature 组合运行，避免既有
 cargo test -p ylong_http_client --features "async http1_1 ylong_base" --test sdv_async_http_proxy -- --nocapture
 ```
 
+benchmark 和 differential test 使用 `tools/https_proxy_bench`：
+
+```bash
+REPEAT=5 tools/https_proxy_bench/run_https_proxy_bench.sh \
+  --url http://127.0.0.1:18080/ \
+  --proxy https://localhost:18443 \
+  --proxy-ca-file target/https_proxy_bench/certs/ca.pem \
+  --method POST \
+  --body-size 1048576 \
+  --requests 10000 \
+  --concurrency 64
+```
+
 ## 开源实现参考
 
 - libcurl 将 HTTPS proxy 作为代理传输协议处理，并提供独立 proxy TLS 配置：`CURLOPT_PROXY_CAINFO`、`CURLOPT_PROXY_SSL_VERIFYPEER`、`CURLOPT_PROXY_SSLCERT`、`CURLOPT_PROXY_SSLKEY`、`CURLOPT_PROXY_SSL_CIPHER_LIST`、`CURLOPT_PROXY_TLS13_CIPHERS`。
 - reqwest/hyper 将 proxy matcher、CONNECT tunnel、proxy TLS 和 origin TLS 分层处理，是当前模块边界的主要参考。
+
+## 外部测试套件定位
+
+- badssl：适合补充证书错误、wrong host、自签名、过期证书等 TLS 证书场景；不是 HTTPS proxy 协议测试。
+- BetterTLS：适合更深的 TLS client 证书路径构建和 name constraints 测试；不是 proxy 行为测试。
+- tlsfuzzer / BoringSSL BoGo：适合 TLS 协议异常和兼容性测试；接入 HTTP client proxy 需要额外 harness。
+- curl test suite：可借鉴 proxy 测试思想和外部 proxy 运行方式；不能直接作为 ylong_http_client 的通用验收套件。
 
 参考链接：
 
@@ -193,3 +213,8 @@ cargo test -p ylong_http_client --features "async http1_1 ylong_base" --test sdv
 - https://curl.se/libcurl/c/CURLOPT_PROXY_SSL_CIPHER_LIST.html
 - https://curl.se/libcurl/c/CURLOPT_PROXY_TLS13_CIPHERS.html
 - https://github.com/seanmonstar/reqwest/blob/04a216fc/src/connect.rs
+- https://github.com/chromium/badssl.com
+- https://bettertls.com/
+- https://github.com/tlsfuzzer/tlsfuzzer
+- https://boringssl.googlesource.com/boringssl/+/master/ssl/test/README.md
+- https://curl.se/dev/runtests.html
