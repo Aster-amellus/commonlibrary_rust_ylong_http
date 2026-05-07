@@ -15,7 +15,7 @@ tools/https_proxy_bench/run_https_proxy_bench.sh \
   --concurrency 64
 ```
 
-The runner builds `async_https_proxy_bench`, compiles `libcurl_harness.c` when `curl-config` and `cc` are available, prints one JSON environment line, then prints one JSON metrics line per client run. Set `REPEAT=5` to run both clients five times with the same workload.
+The runner builds `async_https_proxy_bench`, compiles `libcurl_harness.c` when `curl-config` and `cc` are available, prints one JSON environment line, then prints one JSON metrics line per client run. Set `REPEAT=5` to run both clients five times with the same workload. The ylong benchmark client sets its HTTP/1 connection-pool limit to the requested concurrency so the comparison matches libcurl's worker model.
 
 POST upload workloads use the same flags for both clients:
 

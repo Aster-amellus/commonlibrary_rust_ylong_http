@@ -9,7 +9,7 @@
 | O1：补齐 HTTPS proxy 基础能力 | OpenSSL 支持 proxy TLS/mTLS；独立 proxy TLS 配置；async/sync HTTP target over HTTPS proxy；async/sync HTTPS target over HTTPS proxy；hostname、CA、mTLS、cert/key、TLS version/cipher、CONNECT、origin TLS 隔离测试覆盖 | 已完成 conformance hardening |
 | O2：代理功能模块化 | CONNECT tunnel 从 connector 内抽出；async/sync proxy transport 独立模块；代理元数据统一沉淀到 `util::proxy`；连接池 key 纳入 proxy identity；文档记录新增协议扩展入口 | 已完成 v1 + pool key hardening |
 | O3：规范、测试、可用性文档 | 对齐 RFC 9110、RFC 9112、RFC 8446、OpenSSL、libcurl；记录开源 TLS/proxy 测试套件定位；提供 API 文档、使用指南、架构图、测试命令 | 已完成矩阵更新 |
-| O4：性能对比和 profiling 体系 | 提供 ylong/libcurl HTTPS proxy benchmark harness；支持 GET/POST、body size、重复运行、环境元数据、高并发、CA/mTLS 参数；记录 20%+ 目标的测量方法 | 已完成 harness，正式长跑待归档 |
+| O4：性能对比和 profiling 体系 | 提供 ylong/libcurl HTTPS proxy benchmark harness；支持 GET/POST、body size、重复运行、环境元数据、高并发、CA/mTLS 参数；记录 20%+ 目标的测量方法 | 已完成 harness 与正式报告归档 |
 
 ## 阶段架构图
 
@@ -87,6 +87,22 @@ flowchart LR
     YlongRun --> Compare[4 of 5 >= 20% target]
     CurlRun --> Compare
     Compare --> Archive[reproducible report archive]
+```
+
+### P6 benchmark 归档完成后
+
+```mermaid
+flowchart TB
+    Runner[run_https_proxy_bench.sh] --> Workload[HTTP target over HTTPS proxy<br/>5000 requests x 16 concurrency x 5 repeats]
+    Workload --> Ylong[ylong bench<br/>pool size aligned to concurrency]
+    Workload --> Curl[libcurl harness<br/>same URL proxy CA concurrency]
+    Ylong --> Result[5 of 5 runs pass 20%+ target<br/>0 errors]
+    Curl --> Result
+    Result --> Report[docs/https_proxy_benchmark_report.md]
+    Runner --> Profile[PROFILE=time smoke]
+    Profile --> Report
+    Stress[HTTPS target CONNECT stress<br/>concurrency 64] --> Risk[fixture tail latency risk]
+    Risk --> Report
 ```
 
 ## M1 TLS 配置补齐
@@ -168,7 +184,7 @@ cargo test -p ylong_http_client --features "sync http1_1 tokio_base c_openssl_3_
 
 ## M5 性能对比
 
-状态：benchmark/profiling harness 已落地，长时间高压数据需在稳定机器上执行并归档。
+状态：benchmark/profiling harness 已落地，HTTP target over HTTPS proxy 正式报告已归档。
 
 目标：HTTPS proxy 场景下 ylong_http_client HTTP 请求性能比 libcurl 高 20%+。
 
@@ -200,6 +216,7 @@ benchmark 场景：
 - `tools/https_proxy_bench/run_https_proxy_bench.sh` 统一构建并运行两侧 workload；输出环境 JSON；`REPEAT=5` 可重复运行；若系统缺少 `curl-config` 或 `cc`，脚本跳过 libcurl 并说明原因。
 - `tools/https_proxy_bench/local_https_proxy.py` 提供本地 HTTP origin + HTTPS proxy fixture，支持 GET/POST 和固定响应体。
 - profiling 建议使用 `perf stat`、`perf record` 或 `/usr/bin/time -v` 包裹同一 workload。
+- `docs/https_proxy_benchmark_report.md` 归档正式 5 次对比、profiling smoke 和 CONNECT 压测风险。
 
 达标口径：
 
