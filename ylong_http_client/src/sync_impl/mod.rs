@@ -30,6 +30,8 @@ mod conn;
 mod connector;
 mod http_body;
 mod pool;
+#[cfg(feature = "__tls")]
+mod proxy;
 mod reader;
 
 pub use client::{Client, ClientBuilder};

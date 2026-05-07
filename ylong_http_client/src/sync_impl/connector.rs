@@ -75,14 +75,13 @@ pub mod no_tls {
 
 #[cfg(feature = "__tls")]
 pub mod tls_conn {
-    use std::io::{Read, Write};
     use std::net::TcpStream;
 
     use ylong_http::request::uri::{Scheme, Uri};
 
+    use crate::sync_impl::proxy::{connect_tls, tunnel};
     use crate::sync_impl::{Connector, MixStream};
-    use crate::util::c_openssl::ssl::SslStream;
-    use crate::{ErrorKind, HttpClientError, TlsConfig};
+    use crate::{ErrorKind, HttpClientError};
 
     impl Connector for super::HttpConnector {
         type Stream = MixStream<TcpStream>;
@@ -111,9 +110,8 @@ pub mod tls_conn {
 
             match *uri.scheme().unwrap() {
                 Scheme::HTTP => {
-                    let tcp_stream = TcpStream::connect(addr.clone()).map_err(|e| {
-                        HttpClientError::from_error(ErrorKind::Connect, e)
-                    })?;
+                    let tcp_stream = TcpStream::connect(addr.clone())
+                        .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
                     if is_proxy && proxy_scheme == Some(Scheme::HTTPS) {
                         let proxy_config = proxy_tls_config.unwrap_or_default();
                         let proxy_host = proxy_host.unwrap_or_else(|| addr.clone());
@@ -164,95 +162,6 @@ pub mod tls_conn {
                         Ok(MixStream::Https(origin_tls))
                     }
                 }
-            }
-        }
-    }
-
-    fn connect_tls<S>(
-        config: &TlsConfig,
-        domain: &str,
-        stream: S,
-        pin_host: &str,
-    ) -> Result<SslStream<S>, HttpClientError>
-    where
-        S: Read + Write,
-    {
-        let pinned_key = config.pinning_host_match(pin_host);
-        let ssl = config
-            .ssl_new(domain)
-            .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
-        let mut stream = SslStream::new_base(ssl.into_inner(), stream, pinned_key)
-            .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
-        stream
-            .connect()
-            .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
-        Ok(stream)
-    }
-
-    fn tunnel<S>(
-        mut conn: S,
-        host: String,
-        port: u16,
-        auth: Option<String>,
-    ) -> Result<S, HttpClientError>
-    where
-        S: Read + Write,
-    {
-        let mut req = Vec::new();
-
-        // `unwrap()` never failed here.
-        write!(
-            &mut req,
-            "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
-        )
-        .unwrap();
-
-        if let Some(value) = auth {
-            write!(&mut req, "Proxy-Authorization: Basic {value}\r\n").unwrap();
-        }
-
-        write!(&mut req, "\r\n").unwrap();
-
-        conn.write_all(&req)
-            .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
-
-        let mut buf = [0; 8192];
-        let mut pos = 0;
-
-        loop {
-            let n = conn
-                .read(&mut buf[pos..])
-                .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
-
-            if n == 0 {
-                return Err(HttpClientError::from_str(
-                    ErrorKind::Connect,
-                    "Error receiving from proxy",
-                ));
-            }
-
-            pos += n;
-            let resp = &buf[..pos];
-            if resp.starts_with(b"HTTP/1.1 200") {
-                if resp.ends_with(b"\r\n\r\n") {
-                    return Ok(conn);
-                }
-                if pos == buf.len() {
-                    return Err(HttpClientError::from_str(
-                        ErrorKind::Connect,
-                        "proxy headers too long for tunnel",
-                    ));
-                }
-            } else if resp.starts_with(b"HTTP/1.1 407") {
-                return Err(HttpClientError::from_str(
-                    ErrorKind::Connect,
-                    "proxy authentication required",
-                ));
-            } else {
-                return Err(HttpClientError::from_str(
-                    ErrorKind::Connect,
-                    "unsuccessful tunnel",
-                ));
             }
         }
     }
