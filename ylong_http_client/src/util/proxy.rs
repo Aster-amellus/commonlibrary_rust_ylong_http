@@ -149,6 +149,8 @@ pub(crate) struct ProxyInfo {
     pub(crate) scheme: Scheme,
     pub(crate) authority: Authority,
     pub(crate) basic_auth: Option<HeaderValue>,
+    #[cfg(feature = "__tls")]
+    pub(crate) tls_config: Option<crate::util::TlsConfig>,
 }
 
 impl ProxyInfo {
@@ -167,6 +169,8 @@ impl ProxyInfo {
             basic_auth: None,
             scheme: scheme.unwrap(),
             authority: authority.unwrap(),
+            #[cfg(feature = "__tls")]
+            tls_config: None,
         })
     }
 
@@ -176,6 +180,11 @@ impl ProxyInfo {
 
     pub(crate) fn scheme(&self) -> &Scheme {
         &self.scheme
+    }
+
+    #[cfg(feature = "__tls")]
+    pub(crate) fn tls_config(&self) -> Option<&crate::util::TlsConfig> {
+        self.tls_config.as_ref()
     }
 }
 

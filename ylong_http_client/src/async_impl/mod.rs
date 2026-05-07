@@ -36,6 +36,8 @@ mod uploader;
 
 #[cfg(feature = "__tls")]
 mod ssl_stream;
+#[cfg(feature = "__tls")]
+mod proxy;
 
 #[cfg(feature = "__tls")]
 pub(crate) mod mix;

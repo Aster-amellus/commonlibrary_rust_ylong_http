@@ -448,6 +448,31 @@ impl ProxyBuilder {
         self
     }
 
+    /// Sets TLS configuration used when connecting to an HTTPS proxy server.
+    ///
+    /// This does not affect TLS configuration for the final origin server.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ylong_http_client::{Proxy, TlsConfig};
+    ///
+    /// let proxy_tls = TlsConfig::builder().build().unwrap();
+    /// let builder = Proxy::all("https://example.com").proxy_tls_config(proxy_tls);
+    /// ```
+    #[cfg(feature = "__tls")]
+    pub fn proxy_tls_config(mut self, tls_config: crate::util::TlsConfig) -> Self {
+        self.inner = self.inner.map(|mut proxy| {
+            match &mut proxy.intercept {
+                proxy::Intercept::All(info)
+                | proxy::Intercept::Http(info)
+                | proxy::Intercept::Https(info) => info.tls_config = Some(tls_config),
+            }
+            proxy
+        });
+        self
+    }
+
     /// Constructs a `Proxy`.
     ///
     /// # Examples
@@ -612,5 +637,23 @@ mod ut_settings {
         let proxy = Proxy::https("http://127.0.0.1:6789").build().unwrap();
         let uri = Uri::from_bytes(b"https://127.0.0.1:3456").unwrap();
         assert!(proxy.inner().is_intercepted(&uri));
+    }
+
+    /// UT test cases for `ProxyBuilder::proxy_tls_config`.
+    ///
+    /// # Brief
+    /// 1. Creates a `Proxy` with an HTTPS proxy endpoint.
+    /// 2. Sets proxy TLS configuration.
+    /// 3. Checks if the TLS configuration is stored on proxy metadata.
+    #[cfg(feature = "__tls")]
+    #[test]
+    fn ut_proxy_tls_config() {
+        let tls = crate::util::TlsConfig::builder().build().unwrap();
+        let proxy = Proxy::https("https://127.0.0.1:6789")
+            .proxy_tls_config(tls)
+            .build()
+            .unwrap()
+            .inner();
+        assert!(proxy.intercept.proxy_info().tls_config().is_some());
     }
 }

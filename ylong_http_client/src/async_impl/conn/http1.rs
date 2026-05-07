@@ -191,7 +191,16 @@ where
     S: AsyncRead + AsyncWrite + ConnInfo + Sync + Send + Unpin + 'static,
 {
     // Encodes and sends Request-line and Headers(non-body fields).
-    let mut part_encoder = RequestEncoder::new(request.part().clone());
+    let mut part = request.part().clone();
+    if conn.raw_mut().is_proxy() && request.uri().scheme() == Some(&Scheme::HTTP) {
+        let conn_data = conn.raw_mut().conn_data();
+        if let Some(auth) = conn_data.proxy_auth() {
+            let auth = format!("Basic {auth}");
+            let _ = part.headers.insert("Proxy-Authorization", auth.as_bytes());
+        }
+    }
+
+    let mut part_encoder = RequestEncoder::new(part);
     if conn.raw_mut().is_proxy() && request.uri().scheme() == Some(&Scheme::HTTP) {
         part_encoder.absolute_uri(true);
     }

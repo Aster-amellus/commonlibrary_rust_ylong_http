@@ -92,6 +92,7 @@ pub struct ConnData {
     #[cfg(feature = "http2")]
     negotiate: NegotiateInfo,
     proxy: bool,
+    proxy_auth: Option<String>,
     time_group: TimeGroup,
 }
 
@@ -114,6 +115,10 @@ impl ConnData {
         self.proxy
     }
 
+    pub(crate) fn proxy_auth(&self) -> Option<&str> {
+        self.proxy_auth.as_deref()
+    }
+
     pub(crate) fn time_group_mut(&mut self) -> &mut TimeGroup {
         &mut self.time_group
     }
@@ -125,6 +130,7 @@ pub struct ConnDataBuilder {
     #[cfg(feature = "http2")]
     negotiate: NegotiateInfo,
     proxy: bool,
+    proxy_auth: Option<String>,
     time_group: TimeGroup,
 }
 
@@ -142,6 +148,11 @@ impl ConnDataBuilder {
         self
     }
 
+    pub(crate) fn proxy_auth(mut self, auth: Option<String>) -> Self {
+        self.proxy_auth = auth;
+        self
+    }
+
     /// Set the time required for each phase of connection establishment.
     pub fn time_group(mut self, time_group: TimeGroup) -> Self {
         self.time_group = time_group;
@@ -155,6 +166,7 @@ impl ConnDataBuilder {
             #[cfg(feature = "http2")]
             negotiate: self.negotiate,
             proxy: self.proxy,
+            proxy_auth: self.proxy_auth,
             time_group: self.time_group,
         }
     }
