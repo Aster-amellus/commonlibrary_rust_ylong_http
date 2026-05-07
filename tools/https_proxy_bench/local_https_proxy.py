@@ -50,6 +50,16 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+class ThreadingHTTPSServer(ThreadingHTTPServer):
+    def __init__(self, address, handler, context):
+        super().__init__(address, handler)
+        self.context = context
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        return self.context.wrap_socket(sock, server_side=True), addr
+
+
 class HttpsProxyServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -163,9 +173,14 @@ def serve(server):
     return thread
 
 
-def build_context(args):
+def build_server_context(cert_file, key_file):
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    context.load_cert_chain(args.cert_file, args.key_file)
+    context.load_cert_chain(cert_file, key_file)
+    return context
+
+
+def build_proxy_context(args):
+    context = build_server_context(args.cert_file, args.key_file)
     if args.require_client_cert:
         context.verify_mode = ssl.CERT_REQUIRED
         context.load_verify_locations(cafile=args.ca_file)
@@ -178,6 +193,7 @@ def parse_args():
     parser.add_argument("--key-file", required=True)
     parser.add_argument("--ca-file")
     parser.add_argument("--require-client-cert", action="store_true")
+    parser.add_argument("--origin-tls", action="store_true")
     parser.add_argument("--origin-port", type=int, default=0)
     parser.add_argument("--proxy-port", type=int, default=0)
     parser.add_argument("--response-size", type=int, default=1024)
@@ -190,11 +206,18 @@ def main():
         raise SystemExit("--require-client-cert requires --ca-file")
 
     OriginHandler.response_size = args.response_size
-    origin = ThreadingHTTPServer(("127.0.0.1", args.origin_port), OriginHandler)
+    if args.origin_tls:
+        origin = ThreadingHTTPSServer(
+            ("127.0.0.1", args.origin_port),
+            OriginHandler,
+            build_server_context(args.cert_file, args.key_file),
+        )
+    else:
+        origin = ThreadingHTTPServer(("127.0.0.1", args.origin_port), OriginHandler)
     proxy = HttpsProxyServer(
         ("127.0.0.1", args.proxy_port),
         ProxyHandler,
-        build_context(args),
+        build_proxy_context(args),
         args.response_size,
     )
 
@@ -203,13 +226,18 @@ def main():
 
     origin_host, origin_port = origin.server_address
     proxy_host, proxy_port = proxy.server_address
+    origin_scheme = "https" if args.origin_tls else "http"
+    origin_url = f"{origin_scheme}://{origin_host}:{origin_port}/"
+    payload = {
+        "origin_url": origin_url,
+        "https_proxy": f"https://localhost:{proxy_port}",
+    }
+    if args.origin_tls:
+        payload["https_url"] = origin_url
+    else:
+        payload["http_url"] = origin_url
     print(
-        json.dumps(
-            {
-                "http_url": f"http://{origin_host}:{origin_port}/",
-                "https_proxy": f"https://localhost:{proxy_port}",
-            }
-        ),
+        json.dumps(payload),
         flush=True,
     )
 

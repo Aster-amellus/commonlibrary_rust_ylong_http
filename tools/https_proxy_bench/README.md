@@ -49,6 +49,26 @@ tools/https_proxy_bench/local_https_proxy.py \
 
 The fixture prints JSON containing `http_url` and `https_proxy`. Use those values in `run_https_proxy_bench.sh`.
 
+To benchmark `HTTPS target over HTTPS proxy`, start the same fixture with an HTTPS origin:
+
+```bash
+tools/https_proxy_bench/local_https_proxy.py \
+  --cert-file target/https_proxy_bench/certs/server.pem \
+  --key-file target/https_proxy_bench/certs/server.key \
+  --origin-tls \
+  --response-size 1024 \
+  --origin-port 18080 \
+  --proxy-port 18443
+
+tools/https_proxy_bench/run_https_proxy_bench.sh \
+  --url https://127.0.0.1:18080/ \
+  --proxy https://localhost:18443 \
+  --proxy-ca-file target/https_proxy_bench/certs/ca.pem \
+  --origin-ca-file target/https_proxy_bench/certs/ca.pem \
+  --requests 10000 \
+  --concurrency 64
+```
+
 For proxy mTLS smoke/performance runs:
 
 ```bash
