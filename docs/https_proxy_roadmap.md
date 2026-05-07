@@ -9,7 +9,7 @@
 | O1：补齐 HTTPS proxy 基础能力 | OpenSSL 支持 proxy TLS/mTLS；独立 proxy TLS 配置；async/sync HTTP target over HTTPS proxy；async/sync HTTPS target over HTTPS proxy；SDV 测试覆盖成功和失败路径 | 已完成 |
 | O2：代理功能模块化 | CONNECT tunnel 从 connector 内抽出；async/sync proxy transport 独立模块；代理元数据统一沉淀到 `util::proxy`；文档记录新增协议扩展入口 | 已完成 v1 |
 | O3：规范、测试、可用性文档 | 对齐 RFC 9110、RFC 9112、RFC 8446、OpenSSL、libcurl；提供 API 文档、使用指南、架构图、测试命令 | 已完成 |
-| O4：性能对比和 profiling 体系 | 提供 ylong/libcurl HTTPS proxy benchmark harness；支持高并发、请求数、HTTP/HTTPS target、CA/mTLS 参数；记录 20%+ 目标的测量方法 | 进行中 |
+| O4：性能对比和 profiling 体系 | 提供 ylong/libcurl HTTPS proxy benchmark harness；支持高并发、请求数、HTTP/HTTPS target、CA/mTLS 参数；记录 20%+ 目标的测量方法 | 已完成 harness |
 
 ## 阶段架构图
 
@@ -138,7 +138,7 @@ cargo test -p ylong_http_client --features "sync http1_1 tokio_base c_openssl_3_
 
 ## M5 性能对比
 
-状态：benchmark harness 待落地。
+状态：benchmark/profiling harness 已落地，长时间高压数据需在稳定机器上执行并归档。
 
 目标：HTTPS proxy 场景下 ylong_http_client HTTP 请求性能比 libcurl 高 20%+。
 
@@ -164,8 +164,38 @@ benchmark 场景：
 
 - 不引入第三方 Rust crate。
 - ylong_http_client 和 libcurl 使用相同 origin/proxy/并发/请求数。
-- libcurl 优先使用 C harness 和 libcurl API；若系统缺少 `curl-config` 或 header，脚本应跳过并说明原因。
+- `ylong_http_client/examples/async_https_proxy_bench.rs` 负责 ylong 侧请求压测。
+- `tools/https_proxy_bench/libcurl_harness.c` 负责 libcurl API 对比。
+- `tools/https_proxy_bench/run_https_proxy_bench.sh` 统一构建并运行两侧 workload；若系统缺少 `curl-config` 或 `cc`，脚本跳过 libcurl 并说明原因。
+- `tools/https_proxy_bench/local_https_proxy.py` 提供本地 HTTP origin + HTTPS proxy fixture。
 - profiling 建议使用 `perf stat`、`perf record` 或 `/usr/bin/time -v` 包裹同一 workload。
+
+smoke 命令：
+
+```bash
+tools/https_proxy_bench/generate_certs.sh target/https_proxy_bench/certs
+tools/https_proxy_bench/local_https_proxy.py \
+  --cert-file target/https_proxy_bench/certs/server.pem \
+  --key-file target/https_proxy_bench/certs/server.key \
+  --ca-file target/https_proxy_bench/certs/ca.pem \
+  --response-size 128 \
+  --origin-port 18080 \
+  --proxy-port 18443
+
+tools/https_proxy_bench/run_https_proxy_bench.sh \
+  --url http://127.0.0.1:18080/ \
+  --proxy https://localhost:18443 \
+  --proxy-ca-file target/https_proxy_bench/certs/ca.pem \
+  --requests 20 \
+  --concurrency 4
+```
+
+本地 smoke 结果格式：
+
+```json
+{"client":"ylong_http_client","completed":20,"errors":0,"rps":424.440}
+{"client":"libcurl","completed":20,"errors":0,"rps":91.931}
+```
 
 ## 风险与后续
 

@@ -17,6 +17,9 @@
 use ylong_http_client::async_impl::{Body, ClientBuilder, Downloader, Request};
 use ylong_http_client::{HttpClientError, Proxy, TlsConfig, TlsFileType};
 
+#[cfg(feature = "__c_openssl")]
+use openssl as _;
+
 #[tokio::main]
 async fn main() -> Result<(), HttpClientError> {
     let proxy_tls = TlsConfig::builder()
