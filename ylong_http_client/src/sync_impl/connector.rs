@@ -81,7 +81,8 @@ pub mod tls_conn {
     use ylong_http::request::uri::{Scheme, Uri};
 
     use crate::sync_impl::{Connector, MixStream};
-    use crate::{ErrorKind, HttpClientError};
+    use crate::util::c_openssl::ssl::SslStream;
+    use crate::{ErrorKind, HttpClientError, TlsConfig};
 
     impl Connector for super::HttpConnector {
         type Stream = MixStream<TcpStream>;
@@ -94,61 +95,109 @@ pub mod tls_conn {
             let port = uri.port().unwrap().as_u16().unwrap();
             let mut auth = None;
             let mut is_proxy = false;
+            let mut proxy_scheme = None;
+            let mut proxy_host = None;
+            let mut proxy_tls_config = None;
 
             if let Some(proxy) = self.config.proxies.match_proxy(uri) {
+                let info = proxy.intercept.proxy_info();
                 addr = proxy.via_proxy(uri).authority().unwrap().to_string();
-                auth = proxy
-                    .intercept
-                    .proxy_info()
-                    .basic_auth
-                    .as_ref()
-                    .and_then(|v| v.to_string().ok());
+                auth = info.basic_auth.as_ref().and_then(|v| v.to_string().ok());
+                proxy_scheme = Some(info.scheme().clone());
+                proxy_host = Some(info.authority().host().as_str().to_string());
+                proxy_tls_config = info.tls_config().cloned();
                 is_proxy = true;
             }
 
-            let host_name = match uri.host() {
-                Some(host) => host.to_string(),
-                None => "no host in uri".to_string(),
-            };
-
             match *uri.scheme().unwrap() {
                 Scheme::HTTP => {
-                    Ok(MixStream::Http(TcpStream::connect(addr).map_err(|e| {
+                    let tcp_stream = TcpStream::connect(addr.clone()).map_err(|e| {
                         HttpClientError::from_error(ErrorKind::Connect, e)
-                    })?))
+                    })?;
+                    if is_proxy && proxy_scheme == Some(Scheme::HTTPS) {
+                        let proxy_config = proxy_tls_config.unwrap_or_default();
+                        let proxy_host = proxy_host.unwrap_or_else(|| addr.clone());
+                        let proxy_tls = connect_tls(
+                            &proxy_config,
+                            proxy_host.as_str(),
+                            tcp_stream,
+                            addr.as_str(),
+                        )?;
+                        Ok(MixStream::ProxyHttps(proxy_tls))
+                    } else {
+                        Ok(MixStream::Http(tcp_stream))
+                    }
                 }
                 Scheme::HTTPS => {
-                    let tcp_stream = TcpStream::connect(addr)
+                    let origin_pin_host = format!("{host}:{port}");
+                    let tcp_stream = TcpStream::connect(addr.as_str())
                         .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
-
-                    let tcp_stream = if is_proxy {
-                        tunnel(tcp_stream, host, port, auth)?
+                    if is_proxy && proxy_scheme == Some(Scheme::HTTPS) {
+                        let proxy_config = proxy_tls_config.unwrap_or_default();
+                        let proxy_host = proxy_host.unwrap_or_else(|| addr.clone());
+                        let proxy_tls = connect_tls(
+                            &proxy_config,
+                            proxy_host.as_str(),
+                            tcp_stream,
+                            addr.as_str(),
+                        )?;
+                        let tunneled = tunnel(proxy_tls, host.clone(), port, auth)?;
+                        let origin_tls = connect_tls(
+                            &self.config.tls,
+                            host.as_str(),
+                            tunneled,
+                            origin_pin_host.as_str(),
+                        )?;
+                        Ok(MixStream::HttpsOverProxy(origin_tls))
                     } else {
-                        tcp_stream
-                    };
-
-                    let tls_ssl = self
-                        .config
-                        .tls
-                        .ssl_new(&host_name)
-                        .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
-
-                    let stream = tls_ssl
-                        .into_inner()
-                        .connect(tcp_stream)
-                        .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
-                    Ok(MixStream::Https(stream))
+                        let tcp_stream = if is_proxy {
+                            tunnel(tcp_stream, host.clone(), port, auth)?
+                        } else {
+                            tcp_stream
+                        };
+                        let origin_tls = connect_tls(
+                            &self.config.tls,
+                            host.as_str(),
+                            tcp_stream,
+                            origin_pin_host.as_str(),
+                        )?;
+                        Ok(MixStream::Https(origin_tls))
+                    }
                 }
             }
         }
     }
 
-    fn tunnel(
-        mut conn: TcpStream,
+    fn connect_tls<S>(
+        config: &TlsConfig,
+        domain: &str,
+        stream: S,
+        pin_host: &str,
+    ) -> Result<SslStream<S>, HttpClientError>
+    where
+        S: Read + Write,
+    {
+        let pinned_key = config.pinning_host_match(pin_host);
+        let ssl = config
+            .ssl_new(domain)
+            .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
+        let mut stream = SslStream::new_base(ssl.into_inner(), stream, pinned_key)
+            .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
+        stream
+            .connect()
+            .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
+        Ok(stream)
+    }
+
+    fn tunnel<S>(
+        mut conn: S,
         host: String,
         port: u16,
         auth: Option<String>,
-    ) -> Result<TcpStream, HttpClientError> {
+    ) -> Result<S, HttpClientError>
+    where
+        S: Read + Write,
+    {
         let mut req = Vec::new();
 
         // `unwrap()` never failed here.

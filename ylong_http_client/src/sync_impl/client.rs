@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ylong_http::request::uri::Uri;
+use ylong_http::request::uri::{Scheme, Uri};
 
 use super::{Body, Connector, HttpBody, HttpConnector, Request, Response};
 use crate::error::HttpClientError;
@@ -48,6 +48,7 @@ use crate::util::redirect::{RedirectInfo, Trigger};
 pub struct Client<C: Connector> {
     inner: ConnPool<C, C::Stream>,
     config: ClientConfig,
+    proxies: Proxies,
 }
 
 impl Client<HttpConnector> {
@@ -89,6 +90,7 @@ impl<C: Connector> Client<C> {
         Self {
             inner: ConnPool::new(connector),
             config: ClientConfig::new(),
+            proxies: Proxies::default(),
         }
     }
 
@@ -161,7 +163,20 @@ impl<C: Connector> Client<C> {
         uri: Uri,
         request: &mut Request<T>,
     ) -> Result<Response<HttpBody>, HttpClientError> {
-        conn::request(self.inner.connect_to(uri)?, request)
+        let (is_proxy, auth) = self
+            .proxies
+            .match_proxy(&uri)
+            .map(|proxy| {
+                let auth = proxy
+                    .intercept
+                    .proxy_info()
+                    .basic_auth
+                    .as_ref()
+                    .and_then(|v| v.to_string().ok());
+                (uri.scheme() == Some(&Scheme::HTTP), auth)
+            })
+            .unwrap_or((false, None));
+        conn::request(self.inner.connect_to(uri)?, request, is_proxy, auth)
     }
 }
 
@@ -309,8 +324,9 @@ impl ClientBuilder {
     /// let client = ClientBuilder::new().build();
     /// ```
     pub fn build(self) -> Result<Client<HttpConnector>, HttpClientError> {
+        let proxies = self.proxies;
         let config = ConnectorConfig {
-            proxies: self.proxies,
+            proxies: proxies.clone(),
             timeout: self.client.connect_timeout.clone(),
             #[cfg(feature = "__tls")]
             tls: self.tls.build()?,
@@ -321,6 +337,7 @@ impl ClientBuilder {
         Ok(Client {
             inner: ConnPool::new(connector),
             config: self.client,
+            proxies,
         })
     }
 }

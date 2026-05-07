@@ -28,6 +28,8 @@ const TEMP_BUF_SIZE: usize = 16 * 1024;
 pub(crate) fn request<S, T>(
     mut conn: Http1Conn<S>,
     request: &mut Request<T>,
+    is_proxy: bool,
+    proxy_auth: Option<String>,
 ) -> Result<Response<HttpBody>, HttpClientError>
 where
     T: Body,
@@ -36,7 +38,18 @@ where
     let mut buf = vec![0u8; TEMP_BUF_SIZE];
 
     // Encodes request.
-    let mut encode_part = Some(RequestEncoder::new(request.part().clone()));
+    let mut part = request.part().clone();
+    if is_proxy {
+        if let Some(auth) = proxy_auth {
+            let auth = format!("Basic {auth}");
+            let _ = part.headers.insert("Proxy-Authorization", auth.as_bytes());
+        }
+    }
+    let mut encoder = RequestEncoder::new(part);
+    if is_proxy {
+        encoder.absolute_uri(true);
+    }
+    let mut encode_part = Some(encoder);
     let mut encode_body = Some(request.body_mut());
     let mut write = 0;
     while encode_part.is_some() || encode_body.is_some() {

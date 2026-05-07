@@ -20,8 +20,12 @@ use crate::util::c_openssl::ssl::SslStream;
 pub enum MixStream<T> {
     /// A raw HTTP stream.
     Http(T),
-    /// An SSL-wrapped HTTP stream.
+    /// An SSL-wrapped HTTP stream to the origin server.
     Https(SslStream<T>),
+    /// An SSL-wrapped HTTP stream to an HTTPS proxy server.
+    ProxyHttps(SslStream<T>),
+    /// An origin TLS stream layered on top of an HTTPS proxy stream.
+    HttpsOverProxy(SslStream<SslStream<T>>),
 }
 
 impl<T> Read for MixStream<T>
@@ -32,6 +36,8 @@ where
         match &mut *self {
             MixStream::Http(s) => s.read(buf),
             MixStream::Https(s) => s.read(buf),
+            MixStream::ProxyHttps(s) => s.read(buf),
+            MixStream::HttpsOverProxy(s) => s.read(buf),
         }
     }
 }
@@ -43,6 +49,8 @@ where
         match &mut *self {
             MixStream::Http(s) => s.write(buf),
             MixStream::Https(s) => s.write(buf),
+            MixStream::ProxyHttps(s) => s.write(buf),
+            MixStream::HttpsOverProxy(s) => s.write(buf),
         }
     }
 
@@ -50,6 +58,8 @@ where
         match &mut *self {
             MixStream::Http(s) => s.flush(),
             MixStream::Https(s) => s.flush(),
+            MixStream::ProxyHttps(s) => s.flush(),
+            MixStream::HttpsOverProxy(s) => s.flush(),
         }
     }
 }

@@ -28,6 +28,8 @@ pub(crate) trait StreamData: Read {
 pub(crate) fn request<S, T>(
     conn: Conn<S>,
     request: &mut Request<T>,
+    is_proxy: bool,
+    proxy_auth: Option<String>,
 ) -> Result<Response<HttpBody>, HttpClientError>
 where
     T: Body,
@@ -35,7 +37,7 @@ where
 {
     match conn {
         #[cfg(feature = "http1_1")]
-        Conn::Http1(http1) => http1::request(http1, request),
+        Conn::Http1(http1) => http1::request(http1, request, is_proxy, proxy_auth),
 
         #[cfg(feature = "http2")]
         Conn::Http2(_) => todo!(),
