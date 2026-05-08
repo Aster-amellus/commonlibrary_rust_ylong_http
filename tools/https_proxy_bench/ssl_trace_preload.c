@@ -13,11 +13,14 @@
 #include <string.h>
 
 typedef struct ssl_st SSL;
+typedef struct bio_st BIO;
 
 typedef int (*ssl_read_fn)(SSL *, void *, int);
 typedef int (*ssl_read_ex_fn)(SSL *, void *, size_t, size_t *);
 typedef int (*ssl_write_fn)(SSL *, const void *, int);
 typedef int (*ssl_write_ex_fn)(SSL *, const void *, size_t, size_t *);
+typedef int (*bio_read_fn)(BIO *, void *, int);
+typedef int (*bio_write_fn)(BIO *, const void *, int);
 
 #define HIST_BINS 65
 
@@ -25,6 +28,8 @@ static ssl_read_fn real_ssl_read;
 static ssl_read_ex_fn real_ssl_read_ex;
 static ssl_write_fn real_ssl_write;
 static ssl_write_ex_fn real_ssl_write_ex;
+static bio_read_fn real_bio_read;
+static bio_write_fn real_bio_write;
 static pthread_once_t resolve_once = PTHREAD_ONCE_INIT;
 
 static unsigned long long ssl_read_calls;
@@ -37,10 +42,22 @@ static unsigned long long ssl_read_requested_bytes;
 static unsigned long long ssl_read_returned_bytes;
 static unsigned long long ssl_write_requested_bytes;
 static unsigned long long ssl_write_returned_bytes;
+static unsigned long long bio_read_calls;
+static unsigned long long bio_write_calls;
+static unsigned long long bio_read_errors;
+static unsigned long long bio_write_errors;
+static unsigned long long bio_read_requested_bytes;
+static unsigned long long bio_read_returned_bytes;
+static unsigned long long bio_write_requested_bytes;
+static unsigned long long bio_write_returned_bytes;
 static unsigned long long ssl_read_requested_hist[HIST_BINS];
 static unsigned long long ssl_read_returned_hist[HIST_BINS];
 static unsigned long long ssl_write_requested_hist[HIST_BINS];
 static unsigned long long ssl_write_returned_hist[HIST_BINS];
+static unsigned long long bio_read_requested_hist[HIST_BINS];
+static unsigned long long bio_read_returned_hist[HIST_BINS];
+static unsigned long long bio_write_requested_hist[HIST_BINS];
+static unsigned long long bio_write_returned_hist[HIST_BINS];
 
 static void resolve_symbols(void)
 {
@@ -48,6 +65,8 @@ static void resolve_symbols(void)
     real_ssl_read_ex = (ssl_read_ex_fn)dlsym(RTLD_NEXT, "SSL_read_ex");
     real_ssl_write = (ssl_write_fn)dlsym(RTLD_NEXT, "SSL_write");
     real_ssl_write_ex = (ssl_write_ex_fn)dlsym(RTLD_NEXT, "SSL_write_ex");
+    real_bio_read = (bio_read_fn)dlsym(RTLD_NEXT, "BIO_read");
+    real_bio_write = (bio_write_fn)dlsym(RTLD_NEXT, "BIO_write");
 }
 
 static unsigned int hist_bin(size_t value)
@@ -142,6 +161,44 @@ int SSL_write_ex(SSL *ssl, const void *buf, size_t num, size_t *written)
     return ret;
 }
 
+int BIO_read(BIO *bio, void *buf, int len)
+{
+    pthread_once(&resolve_once, resolve_symbols);
+    int ret = real_bio_read(bio, buf, len);
+
+    add_counter(&bio_read_calls, 1);
+    if (len > 0) {
+        add_counter(&bio_read_requested_bytes, (unsigned long long)len);
+        add_hist(bio_read_requested_hist, (size_t)len);
+    }
+    if (ret > 0) {
+        add_counter(&bio_read_returned_bytes, (unsigned long long)ret);
+        add_hist(bio_read_returned_hist, (size_t)ret);
+    } else {
+        add_counter(&bio_read_errors, 1);
+    }
+    return ret;
+}
+
+int BIO_write(BIO *bio, const void *buf, int len)
+{
+    pthread_once(&resolve_once, resolve_symbols);
+    int ret = real_bio_write(bio, buf, len);
+
+    add_counter(&bio_write_calls, 1);
+    if (len > 0) {
+        add_counter(&bio_write_requested_bytes, (unsigned long long)len);
+        add_hist(bio_write_requested_hist, (size_t)len);
+    }
+    if (ret > 0) {
+        add_counter(&bio_write_returned_bytes, (unsigned long long)ret);
+        add_hist(bio_write_returned_hist, (size_t)ret);
+    } else {
+        add_counter(&bio_write_errors, 1);
+    }
+    return ret;
+}
+
 static unsigned long long load_counter(unsigned long long *counter)
 {
     return __atomic_load_n(counter, __ATOMIC_RELAXED);
@@ -182,6 +239,14 @@ static void print_report(void)
     fprintf(out, "\"ssl_write_errors\":%llu,", load_counter(&ssl_write_errors));
     fprintf(out, "\"ssl_write_requested_bytes\":%llu,", load_counter(&ssl_write_requested_bytes));
     fprintf(out, "\"ssl_write_returned_bytes\":%llu,", load_counter(&ssl_write_returned_bytes));
+    fprintf(out, "\"bio_read_calls\":%llu,", load_counter(&bio_read_calls));
+    fprintf(out, "\"bio_read_errors\":%llu,", load_counter(&bio_read_errors));
+    fprintf(out, "\"bio_read_requested_bytes\":%llu,", load_counter(&bio_read_requested_bytes));
+    fprintf(out, "\"bio_read_returned_bytes\":%llu,", load_counter(&bio_read_returned_bytes));
+    fprintf(out, "\"bio_write_calls\":%llu,", load_counter(&bio_write_calls));
+    fprintf(out, "\"bio_write_errors\":%llu,", load_counter(&bio_write_errors));
+    fprintf(out, "\"bio_write_requested_bytes\":%llu,", load_counter(&bio_write_requested_bytes));
+    fprintf(out, "\"bio_write_returned_bytes\":%llu,", load_counter(&bio_write_returned_bytes));
     print_hist(out, "ssl_read_requested_hist", ssl_read_requested_hist);
     fputc(',', out);
     print_hist(out, "ssl_read_returned_hist", ssl_read_returned_hist);
@@ -189,6 +254,14 @@ static void print_report(void)
     print_hist(out, "ssl_write_requested_hist", ssl_write_requested_hist);
     fputc(',', out);
     print_hist(out, "ssl_write_returned_hist", ssl_write_returned_hist);
+    fputc(',', out);
+    print_hist(out, "bio_read_requested_hist", bio_read_requested_hist);
+    fputc(',', out);
+    print_hist(out, "bio_read_returned_hist", bio_read_returned_hist);
+    fputc(',', out);
+    print_hist(out, "bio_write_requested_hist", bio_write_requested_hist);
+    fputc(',', out);
+    print_hist(out, "bio_write_returned_hist", bio_write_returned_hist);
     fprintf(out, "}\n");
 
     if (out != stderr) {
