@@ -433,7 +433,10 @@ impl<S: AsyncRead + AsyncWrite + ConnInfo + Unpin + Send + Sync + 'static> Conns
         let mut list = self.list.lock().unwrap();
         // TODO Distinguish between http2 connections and http1 connections.
         list.retain(|dispatcher| !dispatcher.is_shutdown());
-        let conn = list.iter().find_map(|dispatcher| dispatcher.dispatch());
+        let conn = list
+            .iter()
+            .rev()
+            .find_map(|dispatcher| dispatcher.dispatch());
         match conn {
             Some(Conn::Http1(mut h1)) => {
                 h1.occupy_sem(permit);
