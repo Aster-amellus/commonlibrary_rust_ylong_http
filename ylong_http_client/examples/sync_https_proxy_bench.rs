@@ -49,6 +49,7 @@ struct Config {
 struct WorkerResult {
     latencies_us: Vec<u128>,
     bytes: u64,
+    body_reads: u64,
     errors: usize,
 }
 
@@ -75,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(
-        "{{\"client\":\"ylong_http_client_sync\",\"url\":\"{}\",\"proxy\":\"{}\",\"method\":\"{}\",\"body_size\":{},\"requests\":{},\"warmup_requests\":{},\"completed\":{},\"errors\":{},\"concurrency\":{},\"runtime_threads\":{},\"read_buffer_size\":{},\"prebuilt_requests\":{},\"bytes\":{},\"elapsed_ms\":{:.3},\"rps\":{:.3},\"latency_us_p50\":{},\"latency_us_p90\":{},\"latency_us_p95\":{},\"latency_us_p99\":{}}}",
+        "{{\"client\":\"ylong_http_client_sync\",\"url\":\"{}\",\"proxy\":\"{}\",\"method\":\"{}\",\"body_size\":{},\"requests\":{},\"warmup_requests\":{},\"completed\":{},\"errors\":{},\"concurrency\":{},\"runtime_threads\":{},\"read_buffer_size\":{},\"prebuilt_requests\":{},\"bytes\":{},\"body_reads\":{},\"avg_body_read_size\":{:.3},\"elapsed_ms\":{:.3},\"rps\":{:.3},\"latency_us_p50\":{},\"latency_us_p90\":{},\"latency_us_p95\":{},\"latency_us_p99\":{}}}",
         escape_json(&config.url),
         escape_json(&config.proxy),
         escape_json(&config.method),
@@ -89,6 +90,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.read_buffer_size,
         config.prebuilt_requests,
         result.bytes,
+        result.body_reads,
+        average_read_size(result.bytes, result.body_reads),
         elapsed_ms,
         rps,
         percentile(&latencies, 50),
@@ -103,6 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct WorkloadResult {
     latencies_us: Vec<u128>,
     bytes: u64,
+    body_reads: u64,
     errors: usize,
     elapsed: std::time::Duration,
 }
@@ -125,17 +129,20 @@ fn run_workload(config: Arc<Config>) -> WorkloadResult {
 
     let mut latencies_us = Vec::with_capacity(config.requests);
     let mut bytes = 0;
+    let mut body_reads = 0;
     let mut errors = 0;
     for handle in handles {
         let result = join_worker(handle);
         latencies_us.extend(result.latencies_us);
         bytes += result.bytes;
+        body_reads += result.body_reads;
         errors += result.errors;
     }
 
     WorkloadResult {
         latencies_us,
         bytes,
+        body_reads,
         errors,
         elapsed: started.elapsed(),
     }
@@ -192,6 +199,7 @@ fn run_worker(
         return WorkerResult {
             latencies_us: Vec::new(),
             bytes: 0,
+            body_reads: 0,
             errors: warmup_count + measured_count,
         };
     };
@@ -213,6 +221,7 @@ fn run_worker(
                     return WorkerResult {
                         latencies_us: Vec::new(),
                         bytes: 0,
+                        body_reads: 0,
                         errors: errors + measured_count,
                     };
                 }
@@ -228,15 +237,17 @@ fn run_worker(
     let mut result = WorkerResult {
         latencies_us: Vec::with_capacity(measured_count),
         bytes: 0,
+        body_reads: 0,
         errors,
     };
     if let Some(requests) = measured_requests {
         for request in requests {
             let started = Instant::now();
             match send_get_request(&client, request, &mut read_buffer) {
-                Ok(bytes) => {
+                Ok(stats) => {
                     result.latencies_us.push(started.elapsed().as_micros());
-                    result.bytes += bytes;
+                    result.bytes += stats.bytes;
+                    result.body_reads += stats.body_reads;
                 }
                 Err(_) => result.errors += 1,
             }
@@ -245,9 +256,10 @@ fn run_worker(
         for _ in 0..measured_count {
             let started = Instant::now();
             match request_once(&client, &config, &mut read_buffer) {
-                Ok(bytes) => {
+                Ok(stats) => {
                     result.latencies_us.push(started.elapsed().as_micros());
-                    result.bytes += bytes;
+                    result.bytes += stats.bytes;
+                    result.body_reads += stats.body_reads;
                 }
                 Err(_) => result.errors += 1,
             }
@@ -260,7 +272,7 @@ fn request_once<C>(
     client: &Client<C>,
     config: &Config,
     read_buffer: &mut [u8],
-) -> Result<u64, HttpClientError>
+) -> Result<ResponseStats, HttpClientError>
 where
     C: Connector,
 {
@@ -285,7 +297,7 @@ fn send_get_request<C>(
     client: &Client<C>,
     request: Request<EmptyBody>,
     read_buffer: &mut [u8],
-) -> Result<u64, HttpClientError>
+) -> Result<ResponseStats, HttpClientError>
 where
     C: Connector,
 {
@@ -296,7 +308,7 @@ where
 fn drain_response(
     response: &mut Response<HttpBody>,
     read_buffer: &mut [u8],
-) -> Result<u64, HttpClientError> {
+) -> Result<ResponseStats, HttpClientError> {
     if !response.status().is_successful() {
         return Err(HttpClientError::other(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -305,20 +317,28 @@ fn drain_response(
     }
 
     let mut bytes = 0;
+    let mut body_reads = 0;
     loop {
         let size = response.body_mut().data(read_buffer)?;
         if size == 0 {
             break;
         }
         bytes += size as u64;
+        body_reads += 1;
     }
-    Ok(bytes)
+    Ok(ResponseStats { bytes, body_reads })
+}
+
+struct ResponseStats {
+    bytes: u64,
+    body_reads: u64,
 }
 
 fn join_worker(handle: JoinHandle<WorkerResult>) -> WorkerResult {
     handle.join().unwrap_or(WorkerResult {
         latencies_us: Vec::new(),
         bytes: 0,
+        body_reads: 0,
         errors: 1,
     })
 }
@@ -330,6 +350,14 @@ fn requests_for_worker(total: usize, concurrency: usize, worker: usize) -> usize
         base + 1
     } else {
         base
+    }
+}
+
+fn average_read_size(bytes: u64, body_reads: u64) -> f64 {
+    if body_reads == 0 {
+        0.0
+    } else {
+        bytes as f64 / body_reads as f64
     }
 }
 

@@ -40,16 +40,18 @@ typedef struct {
     char *body;
     struct curl_slist *headers;
     uint64_t bytes;
+    uint64_t body_reads;
     size_t completed;
     size_t errors;
 } Worker;
 
 static size_t write_body(char *ptr, size_t size, size_t nmemb, void *userdata)
 {
-    uint64_t *bytes = (uint64_t *)userdata;
+    Worker *worker = (Worker *)userdata;
     size_t total = size * nmemb;
     (void)ptr;
-    *bytes += (uint64_t)total;
+    worker->bytes += (uint64_t)total;
+    worker->body_reads++;
     return total;
 }
 
@@ -85,7 +87,7 @@ static void set_common_options(CURL *curl, Worker *worker)
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &worker->bytes);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, worker);
     curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, (long)config->read_buffer_size);
 
     if (strcmp(config->method, "POST") == 0) {
@@ -151,6 +153,7 @@ static void *run_worker(void *arg)
         }
     }
     worker->bytes = 0;
+    worker->body_reads = 0;
     pthread_barrier_wait(worker->barrier);
 
     for (size_t i = 0; i < worker->count; i++) {
@@ -308,10 +311,12 @@ int main(int argc, char **argv)
 
     size_t errors = 0;
     uint64_t bytes = 0;
+    uint64_t body_reads = 0;
     for (size_t i = 0; i < config.concurrency; i++) {
         pthread_join(threads[i], NULL);
         errors += workers[i].errors;
         bytes += workers[i].bytes;
+        body_reads += workers[i].body_reads;
     }
     uint64_t elapsed_us = now_us() - started;
     size_t compact = 0;
@@ -333,11 +338,14 @@ int main(int argc, char **argv)
            "\"body_size\":%zu,\"requests\":%zu,\"warmup_requests\":%zu,"
            "\"completed\":%zu,\"errors\":%zu,"
            "\"concurrency\":%zu,\"runtime_threads\":%zu,\"read_buffer_size\":%zu,\"bytes\":%llu,"
+           "\"body_reads\":%llu,\"avg_body_read_size\":%.3f,"
            "\"elapsed_ms\":%.3f,\"rps\":%.3f,\"latency_us_p50\":%llu,"
            "\"latency_us_p90\":%llu,\"latency_us_p95\":%llu,\"latency_us_p99\":%llu}\n",
            config.url, config.proxy, config.method, config.body_size, config.requests,
            config.warmup_requests, completed, errors, config.concurrency,
-           config.runtime_threads, config.read_buffer_size, (unsigned long long)bytes, elapsed_ms, rps,
+           config.runtime_threads, config.read_buffer_size, (unsigned long long)bytes,
+           (unsigned long long)body_reads,
+           body_reads == 0 ? 0.0 : (double)bytes / (double)body_reads, elapsed_ms, rps,
            (unsigned long long)percentile(latencies, completed, 50),
            (unsigned long long)percentile(latencies, completed, 90),
            (unsigned long long)percentile(latencies, completed, 95),

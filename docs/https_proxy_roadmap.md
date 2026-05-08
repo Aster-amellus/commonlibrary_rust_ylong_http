@@ -297,8 +297,8 @@ tools/https_proxy_bench/run_https_proxy_bench.sh \
 
 ```json
 {"kind":"bench_environment","repeat":1,"git":"...","rustc":"...","curl":"...","openssl":"...","uname":"..."}
-{"client":"ylong_http_client","method":"GET","body_size":0,"completed":20,"errors":0,"rps":424.440,"latency_us_p99":1234}
-{"client":"libcurl","method":"GET","body_size":0,"completed":20,"errors":0,"rps":91.931,"latency_us_p99":5678}
+{"client":"ylong_http_client","method":"GET","body_size":0,"completed":20,"errors":0,"bytes":2621440,"body_reads":160,"avg_body_read_size":16384.000,"rps":424.440,"latency_us_p99":1234}
+{"client":"libcurl","method":"GET","body_size":0,"completed":20,"errors":0,"bytes":2621440,"body_reads":160,"avg_body_read_size":16384.000,"rps":91.931,"latency_us_p99":5678}
 ```
 
 CONNECT 高压当前结论：
