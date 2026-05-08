@@ -32,6 +32,7 @@ Common options forwarded to both clients:
 
 ylong-only options:
   --client-per-worker
+  --trace-summary
 
 Profiling:
   REPEAT=N          run each client N times
@@ -109,6 +110,9 @@ ylong_args=()
 for arg in "$@"; do
     case "$arg" in
         --client-per-worker)
+            ylong_args+=("$arg")
+            ;;
+        --trace-summary)
             ylong_args+=("$arg")
             ;;
         *)
