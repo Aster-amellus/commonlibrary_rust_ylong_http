@@ -62,6 +62,7 @@ struct WorkerResult {
     bytes: u64,
     body_reads: u64,
     errors: usize,
+    elapsed_us: u128,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -119,12 +120,16 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut bytes = 0;
     let mut body_reads = 0;
     let mut errors = 0;
+    let mut worker_elapsed_us = Vec::with_capacity(config.concurrency);
     for handle in handles {
         let result = join_worker(handle).await;
         latencies.extend(result.latencies_us);
         bytes += result.bytes;
         body_reads += result.body_reads;
         errors += result.errors;
+        if result.elapsed_us != 0 {
+            worker_elapsed_us.push(result.elapsed_us);
+        }
     }
     let elapsed = started.elapsed();
 
@@ -139,7 +144,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(
-        "{{\"client\":\"ylong_http_client\",\"url\":\"{}\",\"proxy\":\"{}\",\"method\":\"{}\",\"body_size\":{},\"requests\":{},\"warmup_requests\":{},\"completed\":{},\"errors\":{},\"concurrency\":{},\"runtime_threads\":{},\"read_buffer_size\":{},\"client_per_worker\":{},\"prebuilt_requests\":{},\"bytes\":{},\"body_reads\":{},\"avg_body_read_size\":{:.3},\"elapsed_ms\":{:.3},\"rps\":{:.3},\"latency_us_p50\":{},\"latency_us_p90\":{},\"latency_us_p95\":{},\"latency_us_p99\":{}}}",
+        "{{\"client\":\"ylong_http_client\",\"url\":\"{}\",\"proxy\":\"{}\",\"method\":\"{}\",\"body_size\":{},\"requests\":{},\"warmup_requests\":{},\"completed\":{},\"errors\":{},\"concurrency\":{},\"runtime_threads\":{},\"read_buffer_size\":{},\"client_per_worker\":{},\"prebuilt_requests\":{},\"bytes\":{},\"body_reads\":{},\"avg_body_read_size\":{:.3},\"elapsed_ms\":{:.3},\"rps\":{:.3},\"latency_us_p50\":{},\"latency_us_p90\":{},\"latency_us_p95\":{},\"latency_us_p99\":{},\"worker_elapsed_us_min\":{},\"worker_elapsed_us_max\":{}}}",
         escape_json(&config.url),
         escape_json(&config.proxy),
         escape_json(&config.method),
@@ -162,6 +167,8 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         percentile(&latencies, 90),
         percentile(&latencies, 95),
         percentile(&latencies, 99),
+        min_u128(&worker_elapsed_us),
+        max_u128(&worker_elapsed_us),
     );
 
     Ok(())
@@ -325,6 +332,7 @@ async fn run_worker(
                     bytes: 0,
                     body_reads: 0,
                     errors: warmup_count + measured_count,
+                    elapsed_us: 0,
                 };
             }
         },
@@ -334,6 +342,7 @@ async fn run_worker(
         bytes: 0,
         body_reads: 0,
         errors: 0,
+        elapsed_us: 0,
     };
     let mut read_buffer = vec![0; config.read_buffer_size];
 
@@ -371,6 +380,7 @@ async fn run_worker(
 
     worker_ready_and_wait(gate).await;
 
+    let measured_started = Instant::now();
     if let Some(requests) = measured_requests {
         for request in requests {
             let started = Instant::now();
@@ -405,6 +415,7 @@ async fn run_worker(
         }
     }
 
+    result.elapsed_us = measured_started.elapsed().as_micros();
     result
 }
 
@@ -467,6 +478,7 @@ async fn join_worker(handle: JoinHandle<WorkerResult>) -> WorkerResult {
             bytes: 0,
             body_reads: 0,
             errors: 1,
+            elapsed_us: 0,
         },
     }
 }
@@ -487,6 +499,14 @@ fn requests_for_worker(total: usize, concurrency: usize, worker: usize) -> usize
     } else {
         base
     }
+}
+
+fn min_u128(values: &[u128]) -> u128 {
+    values.iter().copied().min().unwrap_or_default()
+}
+
+fn max_u128(values: &[u128]) -> u128 {
+    values.iter().copied().max().unwrap_or_default()
 }
 
 fn parse_args(args: Vec<String>) -> Result<Config, String> {

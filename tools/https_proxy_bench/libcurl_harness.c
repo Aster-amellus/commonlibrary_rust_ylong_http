@@ -41,6 +41,7 @@ typedef struct {
     struct curl_slist *headers;
     uint64_t bytes;
     uint64_t body_reads;
+    uint64_t elapsed_us;
     size_t completed;
     size_t errors;
 } Worker;
@@ -155,6 +156,7 @@ static void *run_worker(void *arg)
     worker->bytes = 0;
     worker->body_reads = 0;
     pthread_barrier_wait(worker->barrier);
+    uint64_t measured_started = now_us();
 
     for (size_t i = 0; i < worker->count; i++) {
         uint64_t started = now_us();
@@ -166,6 +168,7 @@ static void *run_worker(void *arg)
             worker->errors++;
         }
     }
+    worker->elapsed_us = now_us() - measured_started;
 
     curl_easy_cleanup(curl);
     curl_slist_free_all(worker->headers);
@@ -312,11 +315,20 @@ int main(int argc, char **argv)
     size_t errors = 0;
     uint64_t bytes = 0;
     uint64_t body_reads = 0;
+    uint64_t worker_elapsed_us_min = 0;
+    uint64_t worker_elapsed_us_max = 0;
     for (size_t i = 0; i < config.concurrency; i++) {
         pthread_join(threads[i], NULL);
         errors += workers[i].errors;
         bytes += workers[i].bytes;
         body_reads += workers[i].body_reads;
+        if (workers[i].elapsed_us != 0 &&
+            (worker_elapsed_us_min == 0 || workers[i].elapsed_us < worker_elapsed_us_min)) {
+            worker_elapsed_us_min = workers[i].elapsed_us;
+        }
+        if (workers[i].elapsed_us > worker_elapsed_us_max) {
+            worker_elapsed_us_max = workers[i].elapsed_us;
+        }
     }
     uint64_t elapsed_us = now_us() - started;
     size_t compact = 0;
@@ -340,7 +352,8 @@ int main(int argc, char **argv)
            "\"concurrency\":%zu,\"runtime_threads\":%zu,\"read_buffer_size\":%zu,\"bytes\":%llu,"
            "\"body_reads\":%llu,\"avg_body_read_size\":%.3f,"
            "\"elapsed_ms\":%.3f,\"rps\":%.3f,\"latency_us_p50\":%llu,"
-           "\"latency_us_p90\":%llu,\"latency_us_p95\":%llu,\"latency_us_p99\":%llu}\n",
+           "\"latency_us_p90\":%llu,\"latency_us_p95\":%llu,\"latency_us_p99\":%llu,"
+           "\"worker_elapsed_us_min\":%llu,\"worker_elapsed_us_max\":%llu}\n",
            config.url, config.proxy, config.method, config.body_size, config.requests,
            config.warmup_requests, completed, errors, config.concurrency,
            config.runtime_threads, config.read_buffer_size, (unsigned long long)bytes,
@@ -349,7 +362,9 @@ int main(int argc, char **argv)
            (unsigned long long)percentile(latencies, completed, 50),
            (unsigned long long)percentile(latencies, completed, 90),
            (unsigned long long)percentile(latencies, completed, 95),
-           (unsigned long long)percentile(latencies, completed, 99));
+           (unsigned long long)percentile(latencies, completed, 99),
+           (unsigned long long)worker_elapsed_us_min,
+           (unsigned long long)worker_elapsed_us_max);
 
     curl_global_cleanup();
     pthread_barrier_destroy(&barrier);
