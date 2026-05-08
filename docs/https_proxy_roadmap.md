@@ -145,6 +145,20 @@ flowchart TB
     Next --> Status[O4 remains incomplete<br/>strict CONNECT still not 100%]
 ```
 
+### P10 body-read instrumentation 后
+
+```mermaid
+flowchart TB
+    Connect[HTTPS target over HTTPS proxy<br/>native fixture strict workload] --> Drain[Application body drain]
+    Drain --> YlongReads[ylong body_reads 19200<br/>avg read 16 KiB]
+    Drain --> CurlReads[libcurl body_reads 19200<br/>avg read 16 KiB]
+    YlongReads --> Result[avg ylong 3272.0 rps]
+    CurlReads --> Result2[avg libcurl 3381.2 rps]
+    Result --> Status[0 of 5 pass 20% target]
+    Result2 --> Status
+    Status --> Next[Next profiling loop<br/>TLS/BIO read counts + off-CPU scheduling + connection progress]
+```
+
 ## M1 TLS 配置补齐
 
 状态：已完成。
@@ -305,9 +319,10 @@ CONNECT 高压当前结论：
 
 - `HTTPS target over HTTPS proxy` 的 native OpenSSL fixture 已跑通，能稳定验证 outer proxy TLS、CONNECT、inner origin TLS 和 1 MiB 响应体传输。
 - HTTP target over HTTPS proxy 保留 outer proxy TLS 256 KiB read-ahead；HTTPS target over HTTPS proxy 的 CONNECT 外层 proxy TLS 使用 64 KiB read-ahead buffer，避免完全关闭 read-ahead 带来的 syscall 放大，也避免 256 KiB 在嵌套 TLS 下的预读压力。
-- native fixture 下 `requests=300`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`response=1 MiB` 的最新 5 次复测仍为 0/5 达标，ylong 平均约 3705.9 rps，libcurl 平均约 3768.9 rps。
+- native fixture 下 `requests=300`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`response=1 MiB` 的最新 body-read instrumentation 5 次复测仍为 0/5 达标，ylong 平均约 3272.0 rps，libcurl 平均约 3381.2 rps。
 - 真实 `perf stat` / `perf record` 已完成：`requests=10000` 下 ylong async 平均约 3598 rps，libcurl 平均约 3740 rps；ylong cycles、instructions、cache misses 和 context switches 均低于 libcurl，但 wall time 和 p99 仍落后。
 - 完全关闭 CONNECT 外层 read-ahead 后，ylong async 的 `__memmove_avx_unaligned_erms` top self 从前序 profile 的约 16.10% 降到约 3.84%，但 `strace -f -c` 显示 `recvfrom` 次数明显放大；64 KiB buffer 是当前最优折中。
+- body-read instrumentation 显示 ylong 与 libcurl 的应用层 body drain 都是 16 KiB chunk，严格 CONNECT 未达标不能再归因为 benchmark drain buffer 不一致。
 - 因此下一阶段重点从单纯降低 copy，转为 off-CPU scheduler latency、Tokio task migration、CONNECT 双 TLS 读取次数、TLS/BIO read counter 和 per-connection progress 分布。
 - 因此全部 OKR 不能标记为 100% 完成；O4 严格 CONNECT 高压仍未达标。
 

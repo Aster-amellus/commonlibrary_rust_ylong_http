@@ -335,3 +335,39 @@ cargo test -p ylong_http_client --test sdv_sync_https_proxy \
 - CONNECT 外层 proxy TLS 不能直接沿用 HTTP target 路径的 256 KiB read buffer；128 KiB 复测更差，32 KiB p99 更差。
 - 64 KiB 是当前本地 native CONNECT fixture 下的最好折中：减少完全关闭 read-ahead 带来的 syscall 压力，同时避免 256 KiB 下明显的嵌套 TLS 预读和复制放大。
 - 下一步优化不能只调 OpenSSL read buffer，需要定位剩余 p99/调度差距：off-CPU、scheduler latency、Tokio task migration、每连接读取进度和 TLS/BIO read 次数。
+
+## Native CONNECT body-read instrumentation
+
+结论：应用层响应体读取 chunk 大小已经与 libcurl 对齐，不能继续把严格 CONNECT 未达标归因为 benchmark drain buffer 不一致。
+
+变更 commit：
+
+```text
+75eaf31 bench(proxy): report response body read chunks
+```
+
+`requests=300`、`REPEAT=5`、`concurrency=64`、`runtime_threads=16`、`response=1 MiB`、`read_buffer_size=64 KiB` 复测：
+
+| Run | ylong async rps | libcurl rps | 提升 | ylong body_reads | libcurl body_reads | avg read size | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 3265.911 | 3425.792 | -4.7% | 19200 | 19200 | 16384 | fail |
+| 2 | 3282.499 | 3439.026 | -4.6% | 19200 | 19200 | 16384 | fail |
+| 3 | 3221.091 | 3340.980 | -3.6% | 19200 | 19200 | 16384 | fail |
+| 4 | 3408.323 | 3265.590 | 4.4% | 19200 | 19200 | 16384 | fail |
+| 5 | 3182.171 | 3434.695 | -7.4% | 19200 | 19200 | 16384 | fail |
+
+平均吞吐：
+
+| Client | 平均 rps |
+| --- | ---: |
+| ylong_http_client async | 3271.999 |
+| libcurl | 3381.217 |
+
+平均提升：-3.2%。严格 native CONNECT 口径仍为 0/5 达到 20%+，错误数均为 0。
+
+补充复核：
+
+- `ylong_http_client` 和 libcurl 都以 16 KiB 应用层 chunk drain 1 MiB response：每轮 300 个请求均为 `19200` 次 body read。
+- `runtime_threads=8` 下平均 ylong 约 3165 rps，libcurl 约 3282 rps，仍未达标。
+- sync client 平均约 2904 rps，低于 async 和 libcurl，不是当前严格 CONNECT 的优先优化对象。
+- 下一步需要继续沿 TLS/BIO read 次数、OpenSSL 内部 buffer、off-CPU scheduler latency、连接池 dispatch 和 per-connection progress 分布 profiling。
