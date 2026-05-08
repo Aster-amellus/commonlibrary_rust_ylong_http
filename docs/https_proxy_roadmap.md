@@ -118,6 +118,20 @@ flowchart TB
     Next --> Roadmap[Roadmap remains not 100% complete]
 ```
 
+### P8 CONNECT read-ahead 复核后
+
+```mermaid
+flowchart TB
+    Connect[HTTPS target over HTTPS proxy<br/>outer proxy TLS + CONNECT + inner origin TLS] --> ProxyTls[Outer proxy TLS]
+    Connect --> OriginTls[Inner origin TLS]
+    HttpTarget[HTTP target over HTTPS proxy] --> ProxyReadAhead[Outer proxy TLS read-ahead kept<br/>direct HTTP body over proxy TLS]
+    ProxyTls --> NoReadAhead[Read-ahead disabled on CONNECT layer<br/>avoid nested TLS buffering pressure]
+    OriginTls --> BodyDrain[1 MiB response body drain]
+    BodyDrain --> Perf[perf stat: ylong uses fewer cycles/cache misses<br/>but wall time and p99 still lag libcurl]
+    Perf --> Next[Next profiling loop<br/>off-CPU scheduler latency task migration per-connection progress]
+    Next --> Status[O4 remains incomplete<br/>strict CONNECT is still 0/5]
+```
+
 ## M1 TLS 配置补齐
 
 状态：已完成。
@@ -277,10 +291,11 @@ tools/https_proxy_bench/run_https_proxy_bench.sh \
 CONNECT 高压当前结论：
 
 - `HTTPS target over HTTPS proxy` 的 native OpenSSL fixture 已跑通，能稳定验证 outer proxy TLS、CONNECT、inner origin TLS 和 1 MiB 响应体传输。
-- outer proxy TLS 使用 `SSL_set_read_ahead` 和 `SSL_set_default_read_buffer_len(256 KiB)` 后，短 profile 中 ylong 的 `recvfrom` 次数从约 12.7k 降至约 5.3k。
-- native fixture 下 `requests=300`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`response=1 MiB` 的 5 次复测为 0/5 达标，ylong 平均约 3378 rps，libcurl 平均约 3613 rps。
-- 真实 `perf stat` / `perf record` 已完成：`requests=10000` 下 ylong async 平均约 3548 rps，sync 平均约 3522 rps，libcurl 平均约 3823 rps；ylong async/sync 的 top self hotspot 都是 `__memmove_avx_unaligned_erms`，占比约 15% 到 16%，高于 libcurl 的约 5.9%。
-- 因此全部 OKR 不能标记为 100% 完成；下一阶段需要优先降低 CONNECT 双层 TLS body drain 的额外用户态 copy 和 cache 压力，再复测连接池 dispatch 与调度路径。
+- HTTP target over HTTPS proxy 保留 outer proxy TLS read-ahead；HTTPS target over HTTPS proxy 的 CONNECT 外层 proxy TLS 已关闭 read-ahead，避免外层 TLS 预读内层 TLS 流时放大 OpenSSL 内部缓冲和复制压力。
+- native fixture 下 `requests=300`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`response=1 MiB` 的最新 5 次复测仍为 0/5 达标，ylong 平均约 3444 rps，libcurl 平均约 3672 rps。
+- 真实 `perf stat` / `perf record` 已完成：`requests=10000` 下 ylong async 平均约 3598 rps，libcurl 平均约 3740 rps；ylong cycles、instructions、cache misses 和 context switches 均低于 libcurl，但 wall time 和 p99 仍落后。
+- 关闭 CONNECT 外层 read-ahead 后，ylong async 的 `__memmove_avx_unaligned_erms` top self 从前序 profile 的约 16.10% 降到约 3.84%。因此下一阶段重点从单纯降低 copy，转为 off-CPU scheduler latency、Tokio task migration、CONNECT 双 TLS 读取唤醒次数和 per-connection progress 分布。
+- 因此全部 OKR 不能标记为 100% 完成；O4 严格 CONNECT 高压仍未达标。
 
 ## 风险与后续
 

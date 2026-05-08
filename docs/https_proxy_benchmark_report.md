@@ -208,3 +208,70 @@ cc -O2 -g -fno-omit-frame-pointer -Wall -Wextra -pthread \
 - 优先检查 `ylong_http_client/src/async_impl/http_body.rs` 和 `ylong_http_client/src/sync_impl/http_body.rs` 的 `Content-Length` body 读取路径，减少从 stream 到用户 buffer 之间的额外 copy。
 - 检查 CONNECT 双层 TLS 下 `StreamData::poll_read/read` 是否存在中间缓冲复制或较小 read chunk。
 - 优化完成后必须重新运行本节同一组 `perf stat`、`perf record` 和 `REPEAT=5` 正式验收。
+
+## Native CONNECT read-ahead 复核
+
+结论：`HTTPS target over HTTPS proxy` 的 CONNECT 路径不再对外层 proxy TLS 启用 OpenSSL read-ahead。HTTP target over HTTPS proxy 仍保留 read-ahead，因为该路径外层 TLS 直接承载 HTTP 响应体；CONNECT 路径则是外层 TLS 承载内层 origin TLS，read-ahead 会增加双层 `SSL_read` 的内部缓冲与复制压力。
+
+变更 commit：
+
+```text
+f5ea840 perf(proxy): avoid TLS read-ahead for CONNECT proxy layer
+```
+
+行为验证：
+
+```bash
+cargo test -p ylong_http_client --test sdv_sync_https_proxy \
+  --features "sync http1_1 tokio_base c_openssl_3_0"
+
+cargo test -p ylong_http_client --test sdv_async_https_proxy \
+  --features "async http1_1 ylong_base c_openssl_3_0"
+```
+
+结果：
+
+| Test | Result |
+| --- | --- |
+| `sdv_sync_https_proxy` | 11 passed |
+| `sdv_async_https_proxy` with `ylong_base` | 11 passed |
+| `sdv_async_https_proxy` with `tokio_base` | 0 tests by cfg; this test file is gated on `ylong_base` |
+
+`requests=300`、`REPEAT=5`、`concurrency=64`、`runtime_threads=16`、`response=1 MiB` 复测：
+
+| Run | ylong async rps | libcurl rps | 提升 | errors | 结论 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 1 | 3703.397 | 3806.624 | -2.7% | 0 / 0 | fail |
+| 2 | 3313.453 | 3694.991 | -10.3% | 0 / 0 | fail |
+| 3 | 3312.537 | 3535.526 | -6.3% | 0 / 0 | fail |
+| 4 | 3367.504 | 3613.239 | -6.8% | 0 / 0 | fail |
+| 5 | 3524.712 | 3708.053 | -4.9% | 0 / 0 | fail |
+
+平均吞吐：
+
+| Client | 平均 rps |
+| --- | ---: |
+| ylong_http_client async | 3444.321 |
+| libcurl | 3671.687 |
+
+平均提升：-6.2%。严格 native CONNECT 口径仍为 0/5 达标。
+
+`requests=10000`、`perf stat -r 3` 结果：
+
+| Client | 平均 rps | elapsed | task-clock | cycles | instructions | cache-misses | context switches |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ylong_http_client async | 3597.749 | 2.965s | 14.409s | 61.664B | 73.326B | 359.402M | 8287 |
+| libcurl | 3740.015 | 2.853s | 15.156s | 64.575B | 74.605B | 494.565M | 15806 |
+
+`perf record -F 997 -g --call-graph fp` 观察：
+
+| Client | requests | rps | p99 | top self hotspots |
+| --- | ---: | ---: | ---: | --- |
+| ylong_http_client async | 5000 | 3272.663 | 51.801ms | `_copy_to_iter` 6.44%, `__memmove_avx_unaligned_erms` 3.84% |
+| libcurl | 5000 | 3641.210 | 26.569ms | `_copy_to_iter` 8.79%, `__memmove_avx_unaligned_erms` 5.69% |
+
+归因更新：
+
+- 关闭 CONNECT 外层 read-ahead 后，ylong 的 `memmove` 自身占比明显下降；此前 CONNECT profile 中 ylong async 的 `__memmove_avx_unaligned_erms` 约为 16.10%。
+- 当前 ylong 的 CPU 指标不比 libcurl 差，甚至 cycles、instructions、cache misses 和 context switches 都更低；但 wall time 和 p99 仍落后。
+- 瓶颈已经从明显的用户态复制热点，转为 CONNECT 双 TLS 读取链路的调度/唤醒/尾延迟问题。下一轮不能再只看 top self CPU hotspot，需要补 off-CPU、scheduler latency、Tokio task migration、per-connection progress 分布。
