@@ -64,6 +64,10 @@ where
     )
     .await?;
     encode_various_body(message.request.ref_mut(), &mut conn, &mut buf).await?;
+    if let Err(e) = conn.raw_mut().flush().await {
+        conn.shutdown();
+        return err_from_io!(Request, e);
+    }
     message
         .request
         .ref_mut()
