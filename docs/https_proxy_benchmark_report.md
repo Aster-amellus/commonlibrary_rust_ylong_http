@@ -517,3 +517,71 @@ concurrency=4
 ```
 
 结果：ylong async-ylong 约 4753 rps，libcurl 约 1787 rps，HTTP target over HTTPS proxy 仍保持明显优势。
+
+## Native CONNECT ready-drain 与热连接复用实验
+
+结论：body ready-drain 能显著降低 ylong 应用层 body read 次数，但 strict CONNECT 吞吐仍未达到 20%+ 目标。当前剩余差距不再适合继续靠增大 ready-drain 预算解决。
+
+变更 commit：
+
+```text
+a074348 perf(proxy): reduce CONNECT body poll churn
+```
+
+代码改动：
+
+- `HttpBody` 的 Content-Length / until-close 路径在单次 poll 中最多连续消费 8 次 ready read，减少每个 TLS record 都返回到上层 future 的频率。
+- HTTP/1 idle dispatcher 查找改为反向扫描，偏向复用最近仍然热的连接。
+
+严格 CONNECT no-trace 5-run：
+
+```text
+url=https://127.0.0.1:38081/
+proxy=https://localhost:38444
+requests=300
+warmup=64
+concurrency=64
+runtime_threads=16
+read_buffer_size=262144
+client=async-ylong
+trace_summary=false
+```
+
+| Run | ylong async-ylong rps | libcurl rps | 提升 | ylong body reads | libcurl body reads | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 3832.280 | 3762.039 | +1.9% | 2532 | 19200 | fail |
+| 2 | 3822.962 | 3686.727 | +3.7% | 2644 | 19200 | fail |
+| 3 | 3606.209 | 3395.278 | +6.2% | 2556 | 19200 | fail |
+| 4 | 3791.958 | 3628.535 | +4.5% | 2559 | 19200 | fail |
+| 5 | 3831.178 | 3847.880 | -0.4% | 2672 | 19200 | fail |
+
+平均：
+
+| Client | 平均 rps | 平均 body reads |
+| --- | ---: | ---: |
+| ylong_http_client async-ylong | 3776.917 | 2592.6 |
+| libcurl | 3664.092 | 19200.0 |
+
+平均提升约 +3.1%，但严格 CONNECT 仍为 0/5 达到 20%+。
+
+预算对照：
+
+- `BODY_READY_DRAIN_READS=4`：短测 body reads 约 5k，吞吐基本与 libcurl 持平。
+- `BODY_READY_DRAIN_READS=8`：body reads 约 2.6k，no-trace 5-run 平均约 +3.1%，当前保留。
+- `BODY_READY_DRAIN_READS=16`：body reads 约 1.3k，但单次 read wait 变长，吞吐退化，不保留。
+
+本轮验证：
+
+```bash
+rustfmt --check ylong_http_client/src/async_impl/http_body.rs ylong_http_client/src/async_impl/pool.rs
+cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"
+cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"
+cargo test -p ylong_http_client --test sdv_async_https_proxy --features "async http1_1 ylong_base c_openssl_3_0"
+cargo test -p ylong_http_client --test sdv_async_http_body_io --features "async http1_1 ylong_base"
+```
+
+下一步 profiling 重点：
+
+- 正式吞吐验收不启用 `--trace-summary`，避免 ylong-only instrumentation 污染对比。
+- trace 模式继续用于定位，但重点转向 off-CPU scheduler latency、Pending/wake 间隔、任务迁移和双层 TLS readiness 传播。
+- 在没有上述证据前，不再继续盲目增大 body ready-drain 预算或 TLS read buffer。

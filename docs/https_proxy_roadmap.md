@@ -222,6 +222,21 @@ flowchart TB
     Next --> Status[O4b still incomplete<br/>strict CONNECT 5-run avg only about +0.7%]
 ```
 
+### P15 ready-drain 与热连接复用实验后
+
+```mermaid
+flowchart TB
+    Strict[Native CONNECT strict workload<br/>300 requests x 64 concurrency] --> BodyReady[HttpBody ready-drain<br/>budget 8 ready reads per poll]
+    Strict --> PoolHot[HTTP/1 idle dispatcher LIFO scan<br/>prefer hot reusable connections]
+    BodyReady --> Reads[ylong body_reads avg about 2.6k<br/>libcurl remains 19.2k]
+    PoolHot --> Bench[no-trace strict 5-run]
+    Reads --> Bench
+    Bench --> Result[avg ylong 3776.9 rps<br/>avg libcurl 3664.1 rps<br/>avg +3.1%]
+    Result --> Gate[0 of 5 pass 20% target]
+    Gate --> Status[O4b still incomplete]
+    Status --> Next[Next evidence<br/>off-CPU scheduling and nested TLS readiness]
+```
+
 ## M1 TLS 配置补齐
 
 状态：已完成。
@@ -392,18 +407,20 @@ CONNECT 高压当前结论：
 - worker 级 elapsed range 已接入 ylong/libcurl harness；初步结果显示两者最大 worker elapsed 都接近总 wall time，仍需更细粒度的 connection id / off-CPU trace 才能解释 ylong 更高的 request p99。
 - request trace summary 已能拆分 `request_ready`、`connect`、`request_write`、`response_wait`、`body_first_byte`、`body_drain`、单次 body read wait；当前严格 CONNECT probe 显示 `connect/pool` 不是主因，`response_wait_p99` 是首要尾延迟来源，body drain 长尾为次要来源。
 - HTTP/1 request 写完后已显式 flush 再进入 response read，作为双层 TLS 场景的正确性保护；该改动没有让 strict CONNECT 达到 20% 目标。
-- 最新 strict CONNECT 5-run：ylong async-ylong 平均约 3785.1 rps，libcurl 平均约 3758.0 rps，平均仅约 +0.7%；5 次提升分别约 +0.4%、-1.3%、+4.8%、-2.4%、+2.1%，仍为 0/5 达到 20%+。
+- ready-drain 与热连接复用实验已落地：`HttpBody` 在单次 poll 中最多连续消费 8 次 ready read，HTTP/1 idle dispatcher 改为反向扫描以偏向最近热连接。
+- ready-drain 使 ylong 在 300 个 1 MiB CONNECT 响应中的 body read 次数从约 19.2k 降到约 2.6k；预算 16 会拉长单次 read wait 并退化，因此不保留。
+- 最新 strict CONNECT no-trace 5-run：ylong async-ylong 平均约 3776.9 rps，libcurl 平均约 3664.1 rps，平均约 +3.1%；5 次提升分别约 +1.9%、+3.7%、+6.2%、+4.5%、-0.4%，仍为 0/5 达到 20%+。
 - O4a HTTP target smoke 仍正常：20 request、4 concurrency 下 ylong 约 4753 rps，libcurl 约 1787 rps，说明本阶段没有破坏已完成路径。
-- 因此下一阶段重点从单纯降低 copy 或替换 runtime，转为 off-CPU scheduler latency、per-request connection progress 分布、CONNECT 双 TLS 读写交互和尾延迟归因。
+- 因此下一阶段重点从继续减少 body read 次数，转为 off-CPU scheduler latency、per-request connection progress 分布、CONNECT 双 TLS 读写交互和尾延迟归因。
 - O4a `HTTP target over HTTPS proxy` 已完成并冻结；后续优化不得扩大到该路径，除非用于回归验证。
 - O4b `HTTPS target over HTTPS proxy / CONNECT` 仍未完成；只有严格 CONNECT 场景 5 次中至少 4 次达到 20%+ 后，才能将全部 OKR 标记为 100% 完成。
 
 下一阶段执行顺序：
 
 1. 冻结 HTTP target 256 KiB 与 CONNECT 64 KiB read-ahead 策略。
-2. 给 CONNECT bench 增加 request/connection/body/pool 阶段 histogram，避免继续只看平均吞吐和 CPU top self。
-3. 先定位 p99 差距来自 pool wait、header wait、body drain 还是 Pending/wake 频率。
-4. 若 pool wait 占优，做 sticky connection 或 direct handoff 实验；若 body drain 占优，做 CONNECT-only nested TLS progress loop。
+2. 保留 request/body/pool 阶段 histogram，但正式吞吐验收不启用 `--trace-summary`。
+3. 用 off-CPU sched trace 或等价 runtime 事件确认 p99 差距是否来自 Pending/wake 间隔、任务迁移或双层 TLS readiness 传播。
+4. 若 off-CPU 证据指向 nested TLS readiness，再做 CONNECT-only progress loop；若证据指向调度，再收敛 runtime wake/worker 绑定策略。
 5. 每次优化后复跑 strict CONNECT 5 次，并保留 HTTP target smoke 作为已完成路径的回归保护。
 
 ## 风险与后续
