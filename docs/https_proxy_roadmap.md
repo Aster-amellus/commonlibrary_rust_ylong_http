@@ -9,7 +9,7 @@
 | O1：补齐 HTTPS proxy 基础能力 | OpenSSL 支持 proxy TLS/mTLS；独立 proxy TLS 配置；async/sync HTTP target over HTTPS proxy；async/sync HTTPS target over HTTPS proxy；hostname、CA、mTLS、cert/key、TLS version/cipher、CONNECT、origin TLS 隔离测试覆盖 | 已完成 conformance hardening |
 | O2：代理功能模块化 | CONNECT tunnel 从 connector 内抽出；async/sync proxy transport 独立模块；代理元数据统一沉淀到 `util::proxy`；连接池 key 纳入 proxy identity；文档记录新增协议扩展入口 | 已完成 v1 + pool key hardening |
 | O3：规范、测试、可用性文档 | 对齐 RFC 9110、RFC 9112、RFC 8446、OpenSSL、libcurl；记录开源 TLS/proxy 测试套件定位；提供 API 文档、使用指南、架构图、测试命令 | 已完成矩阵更新 |
-| O4：性能对比和 profiling 体系 | 提供 ylong/libcurl HTTPS proxy benchmark harness；支持 GET/POST、body size、重复运行、环境元数据、高并发、CA/mTLS 参数；记录 20%+ 目标的测量方法 | 已完成 harness 与正式报告归档 |
+| O4：性能对比和 profiling 体系 | 提供 ylong/libcurl HTTPS proxy benchmark harness；支持 GET/POST、body size、重复运行、环境元数据、高并发、CA/mTLS 参数；记录 20%+ 目标的测量方法；所有 HTTPS proxy 子场景均需 4/5 达成 20%+ | harness 已完成；HTTP target 已达标；HTTPS target + CONNECT 高压未达标 |
 
 ## 阶段架构图
 
@@ -105,6 +105,19 @@ flowchart TB
     Risk --> Report
 ```
 
+### P7 native fixture 与 CONNECT 优化复测后
+
+```mermaid
+flowchart TB
+    Native[Native OpenSSL fixture<br/>TLS origin + TLS proxy in one C process] --> Connect[HTTPS target over HTTPS proxy<br/>CONNECT + inner origin TLS]
+    Connect --> Ylong[ylong async benchmark<br/>outer proxy TLS read-ahead + 256 KiB OpenSSL read buffer]
+    Connect --> Curl[libcurl harness<br/>same CA concurrency buffer]
+    Ylong --> Result[0 of 5 runs pass 20%+ target<br/>native fixture shows ylong close but slower]
+    Curl --> Result
+    Result --> Next[Next optimization loop<br/>async futex scheduling + CONNECT read path]
+    Next --> Roadmap[Roadmap remains not 100% complete]
+```
+
 ## M1 TLS 配置补齐
 
 状态：已完成。
@@ -184,7 +197,7 @@ cargo test -p ylong_http_client --features "sync http1_1 tokio_base c_openssl_3_
 
 ## M5 性能对比
 
-状态：benchmark/profiling harness 已落地，HTTP target over HTTPS proxy 正式报告已归档。
+状态：benchmark/profiling harness 已落地，HTTP target over HTTPS proxy 正式报告已归档；HTTPS target over HTTPS proxy 的 CONNECT 高压验收未达标。
 
 目标：HTTPS proxy 场景下 ylong_http_client HTTP 请求性能比 libcurl 高 20%+。
 
@@ -215,6 +228,7 @@ benchmark 场景：
 - `tools/https_proxy_bench/libcurl_harness.c` 负责 libcurl API 对比。
 - `tools/https_proxy_bench/run_https_proxy_bench.sh` 统一构建并运行两侧 workload；输出环境 JSON；`REPEAT=5` 可重复运行；若系统缺少 `curl-config` 或 `cc`，脚本跳过 libcurl 并说明原因。
 - `tools/https_proxy_bench/local_https_proxy.py` 提供本地 HTTP origin + HTTPS proxy fixture，支持 GET/POST 和固定响应体。
+- `tools/https_proxy_bench/native_proxy_fixture.c` 提供原生 OpenSSL TLS origin + TLS proxy fixture，用于移除 `socat` 包装进程对 CONNECT 高压结果的影响。
 - profiling 建议使用 `perf stat`、`perf record` 或 `/usr/bin/time -v` 包裹同一 workload。
 - `docs/https_proxy_benchmark_report.md` 归档正式 5 次对比、profiling smoke 和 CONNECT 压测风险。
 
@@ -259,6 +273,13 @@ tools/https_proxy_bench/run_https_proxy_bench.sh \
 {"client":"ylong_http_client","method":"GET","body_size":0,"completed":20,"errors":0,"rps":424.440,"latency_us_p99":1234}
 {"client":"libcurl","method":"GET","body_size":0,"completed":20,"errors":0,"rps":91.931,"latency_us_p99":5678}
 ```
+
+CONNECT 高压当前结论：
+
+- `HTTPS target over HTTPS proxy` 的 native OpenSSL fixture 已跑通，能稳定验证 outer proxy TLS、CONNECT、inner origin TLS 和 1 MiB 响应体传输。
+- outer proxy TLS 使用 `SSL_set_read_ahead` 和 `SSL_set_default_read_buffer_len(256 KiB)` 后，短 profile 中 ylong 的 `recvfrom` 次数从约 12.7k 降至约 5.3k。
+- native fixture 下 `requests=300`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`response=1 MiB` 的 5 次复测为 0/5 达标，ylong 平均约 3378 rps，libcurl 平均约 3613 rps。
+- 因此全部 OKR 不能标记为 100% 完成；下一阶段需要继续优化 async futex/调度开销、连接池 dispatch 热路径和 CONNECT 双层 TLS body drain。
 
 ## 风险与后续
 

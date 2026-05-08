@@ -79,3 +79,60 @@ PROFILE=time REPEAT=1 tools/https_proxy_bench/run_https_proxy_bench.sh \
 ## 补充压测
 
 `HTTPS target over HTTPS proxy` 使用同一 fixture 的 CONNECT 双层 TLS 路径验证。修正连接池并发上限后，p50 从排队型约 445ms 降到约 41ms，但 `concurrency=64` 下 Python TLS/relay fixture 尾延迟抖动明显，5 次中 3 次达到 20% 目标，平均提升 10.8%。该结果不作为正式性能达标口径，只作为后续使用 native proxy fixture 或真实代理环境复测的风险记录。
+
+## Native CONNECT 复测
+
+结论：严格口径仍未达标，不能将全部 OKR 标记为 100% 完成。
+
+复测环境：原生 C/OpenSSL fixture，同时提供 TLS origin 和 TLS proxy，移除外部 `socat` TLS 包装进程。
+
+```bash
+cc -O2 -Wall -Wextra -pthread \
+  -o target/https_proxy_bench/native_proxy_fixture \
+  tools/https_proxy_bench/native_proxy_fixture.c \
+  $(pkg-config --cflags --libs openssl)
+
+target/https_proxy_bench/native_proxy_fixture \
+  --origin-port 38081 \
+  --proxy-port 38444 \
+  --response-size 1048576 \
+  --origin-tls \
+  --proxy-tls \
+  --cert-file target/https_proxy_bench/certs/server.pem \
+  --key-file target/https_proxy_bench/certs/server.key
+
+REPEAT=5 tools/https_proxy_bench/run_https_proxy_bench.sh \
+  --url https://127.0.0.1:38081/ \
+  --proxy https://localhost:38444 \
+  --proxy-ca-file target/https_proxy_bench/certs/ca.pem \
+  --origin-ca-file target/https_proxy_bench/certs/ca.pem \
+  --requests 300 \
+  --warmup-requests 64 \
+  --concurrency 64 \
+  --runtime-threads 16 \
+  --read-buffer-size 65536
+```
+
+| Run | ylong async rps | libcurl rps | 提升 | ylong errors | libcurl errors | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 3427.832 | 3504.304 | -2.2% | 0 | 0 | fail |
+| 2 | 3393.455 | 3616.157 | -6.2% | 0 | 0 | fail |
+| 3 | 3468.243 | 3678.995 | -5.7% | 0 | 0 | fail |
+| 4 | 3328.815 | 3638.922 | -8.5% | 0 | 0 | fail |
+| 5 | 3270.767 | 3629.325 | -9.9% | 0 | 0 | fail |
+
+平均吞吐：
+
+| Client | 平均 rps |
+| --- | ---: |
+| ylong_http_client async | 3377.822 |
+| libcurl | 3613.541 |
+
+平均提升：-6.5%。当前 native CONNECT workload 为 0/5 达到 20%+，错误数均为 0。
+
+本阶段已落地的 CONNECT 路径优化：
+
+- 外层 HTTPS proxy TLS 启用 OpenSSL `SSL_set_read_ahead`。
+- 外层 HTTPS proxy TLS 设置 `SSL_set_default_read_buffer_len(256 KiB)`，短 profile 中 ylong `recvfrom` 从约 12.7k 降至约 5.3k。
+- async benchmark 增加 warmup barrier、runtime threads、read buffer、GET request prebuild，避免把建连和请求构造成本混入传输阶段。
+- native fixture 复测显示 `socat` 抖动已基本排除，剩余差距集中在 async futex/调度、连接池 dispatch 和 CONNECT 双层 TLS body drain 热路径。
