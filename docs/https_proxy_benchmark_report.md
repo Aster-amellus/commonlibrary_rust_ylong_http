@@ -457,3 +457,63 @@ e75ead5 bench(proxy): report worker elapsed ranges
 - worker max 与总 elapsed 同量级，说明总吞吐主要受最慢 worker/连接批次收尾影响；这一点 ylong 和 libcurl 都成立。
 - ylong 的 request p99 持续高于 libcurl，但 worker max 没有明显更差，说明问题可能在单连接内的请求完成分布、runtime wake 时机或嵌套 TLS record 读取进度，而不是简单的某个 worker 完全卡死。
 - tracefs sched event 当前仍为 root-only，普通用户无法读取 `/sys/kernel/tracing/events/sched/sched_switch/id`；如需 `perf sched`，需要以 root 运行或放开 tracefs sched event 读权限。
+
+## Native CONNECT request trace summary
+
+结论：新增 request trace summary 后，strict CONNECT 的首要尾延迟来源进一步收敛到 response first-byte wait。`connect`/pool 侧 p99 为微秒级，不是当前主因；`body_drain` 仍有长尾，但低于 `response_wait` 对 request p99 的影响。
+
+变更 commit：
+
+```text
+55d88f3 bench(proxy): add CONNECT trace summary histograms
+7cc2ddf bench(proxy): route trace summary to ylong only
+4df43a5 bench(proxy): split HTTP1 response wait timing
+4b057ba fix(http1): flush request before response read
+```
+
+strict CONNECT trace probe：
+
+```text
+requests=300
+warmup=64
+concurrency=64
+runtime_threads=16
+read_buffer_size=65536
+client=async-ylong
+```
+
+代表性 trace summary：
+
+```json
+{"kind":"request_trace_summary","completed":300,"errors":0,"request_ready_p99_us":43645,"connect_p99_us":4,"request_write_p99_us":8707,"response_wait_p99_us":43577,"transfer_p99_us":43601,"body_first_byte_p99_us":2603,"body_drain_p99_us":18261,"body_read_wait_p99_us":151,"body_read_wait_max_us":24833}
+```
+
+观察：
+
+- `connect_p99_us` 只有微秒级，且 `--client-per-worker` 对照更慢，因此当前不优先做 pool direct handoff 或 sticky connection。
+- `response_wait_p99_us` 基本贴近 `transfer_p99_us`，说明 `request_ready` 尾部主要发生在 request 写完到首个响应字节之间。
+- 显式 flush request 后，strict CONNECT 仍未达 20% 目标；该改动保留为 HTTP/1 async 路径的正确性保护。
+- `body_drain_p99_us` 仍有十毫秒级长尾，后续仍需要 nested TLS readiness / off-CPU trace，但它不是本轮 trace 中最大的 p99 来源。
+
+flush 后 strict CONNECT 5-run：
+
+| Run | ylong async-ylong rps | libcurl rps | 提升 | ylong p99 | libcurl p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 3686.770 | 3671.342 | +0.4% | 51.795ms | 23.089ms |
+| 2 | 3741.358 | 3790.415 | -1.3% | 40.437ms | 23.334ms |
+| 3 | 3905.096 | 3726.060 | +4.8% | 36.217ms | 23.741ms |
+| 4 | 3664.173 | 3752.768 | -2.4% | 36.238ms | 24.805ms |
+| 5 | 3928.185 | 3849.213 | +2.1% | 53.612ms | 23.889ms |
+
+平均：ylong async-ylong 约 3785.1 rps，libcurl 约 3758.0 rps，平均提升约 0.7%。严格 CONNECT 仍为 0/5 达到 20%+。
+
+HTTP target regression smoke：
+
+```text
+url=http://127.0.0.1:38081/
+proxy=https://localhost:38444
+requests=20
+concurrency=4
+```
+
+结果：ylong async-ylong 约 4753 rps，libcurl 约 1787 rps，HTTP target over HTTPS proxy 仍保持明显优势。

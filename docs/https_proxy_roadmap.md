@@ -208,6 +208,20 @@ flowchart TB
     Strict --> Gate[4 of 5 must pass 20% target<br/>before O4b is complete]
 ```
 
+### P14 CONNECT response-wait profiling 后
+
+```mermaid
+flowchart TB
+    Strict[Native CONNECT strict workload<br/>300 requests x 64 concurrency] --> Trace[request trace summary]
+    Trace --> Pool[connect/pool p99 microsecond-level<br/>pool dispatch not primary]
+    Trace --> Write[request write p99 below response wait<br/>flush added before response read]
+    Trace --> Wait[response_wait p99 dominates request_ready tail]
+    Trace --> Body[body drain still has outliers<br/>but is secondary to first-byte wait]
+    Wait --> Next[Next required evidence<br/>off-CPU sched trace or nested TLS readiness counters]
+    Body --> Next
+    Next --> Status[O4b still incomplete<br/>strict CONNECT 5-run avg only about +0.7%]
+```
+
 ## M1 TLS 配置补齐
 
 状态：已完成。
@@ -376,6 +390,10 @@ CONNECT 高压当前结论：
 - ylong runtime 对照入口已接入，`requests=300`、`concurrency=64`、`runtime_threads=16` 的 3-run probe 平均约 3772.5 rps，libcurl 平均约 3716.7 rps，仅约 1.5% 提升，未达到 20%。
 - TLS/BIO trace 显示 ylong runtime probe 中 `SSL_read` 次数不高于 libcurl（73016 vs 75726），因此当前严格 CONNECT 差距不能简单归因为 ylong 调用了更多 OpenSSL read。
 - worker 级 elapsed range 已接入 ylong/libcurl harness；初步结果显示两者最大 worker elapsed 都接近总 wall time，仍需更细粒度的 connection id / off-CPU trace 才能解释 ylong 更高的 request p99。
+- request trace summary 已能拆分 `request_ready`、`connect`、`request_write`、`response_wait`、`body_first_byte`、`body_drain`、单次 body read wait；当前严格 CONNECT probe 显示 `connect/pool` 不是主因，`response_wait_p99` 是首要尾延迟来源，body drain 长尾为次要来源。
+- HTTP/1 request 写完后已显式 flush 再进入 response read，作为双层 TLS 场景的正确性保护；该改动没有让 strict CONNECT 达到 20% 目标。
+- 最新 strict CONNECT 5-run：ylong async-ylong 平均约 3785.1 rps，libcurl 平均约 3758.0 rps，平均仅约 +0.7%；5 次提升分别约 +0.4%、-1.3%、+4.8%、-2.4%、+2.1%，仍为 0/5 达到 20%+。
+- O4a HTTP target smoke 仍正常：20 request、4 concurrency 下 ylong 约 4753 rps，libcurl 约 1787 rps，说明本阶段没有破坏已完成路径。
 - 因此下一阶段重点从单纯降低 copy 或替换 runtime，转为 off-CPU scheduler latency、per-request connection progress 分布、CONNECT 双 TLS 读写交互和尾延迟归因。
 - O4a `HTTP target over HTTPS proxy` 已完成并冻结；后续优化不得扩大到该路径，除非用于回归验证。
 - O4b `HTTPS target over HTTPS proxy / CONNECT` 仍未完成；只有严格 CONNECT 场景 5 次中至少 4 次达到 20%+ 后，才能将全部 OKR 标记为 100% 完成。
