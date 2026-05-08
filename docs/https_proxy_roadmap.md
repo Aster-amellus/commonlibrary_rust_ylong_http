@@ -229,8 +229,8 @@ benchmark 场景：
 - `tools/https_proxy_bench/run_https_proxy_bench.sh` 统一构建并运行两侧 workload；输出环境 JSON；`REPEAT=5` 可重复运行；若系统缺少 `curl-config` 或 `cc`，脚本跳过 libcurl 并说明原因。
 - `tools/https_proxy_bench/local_https_proxy.py` 提供本地 HTTP origin + HTTPS proxy fixture，支持 GET/POST 和固定响应体。
 - `tools/https_proxy_bench/native_proxy_fixture.c` 提供原生 OpenSSL TLS origin + TLS proxy fixture，用于移除 `socat` 包装进程对 CONNECT 高压结果的影响。
-- profiling 建议使用 `perf stat`、`perf record` 或 `/usr/bin/time -v` 包裹同一 workload。
-- `docs/https_proxy_benchmark_report.md` 归档正式 5 次对比、profiling smoke 和 CONNECT 压测风险。
+- profiling 使用 `perf stat`、`perf record -g --call-graph dwarf` 或 `/usr/bin/time -v` 包裹同一 workload。
+- `docs/https_proxy_benchmark_report.md` 归档正式 5 次对比、profiling smoke、native CONNECT perf 结果和 CONNECT 压测风险。
 
 达标口径：
 
@@ -279,7 +279,8 @@ CONNECT 高压当前结论：
 - `HTTPS target over HTTPS proxy` 的 native OpenSSL fixture 已跑通，能稳定验证 outer proxy TLS、CONNECT、inner origin TLS 和 1 MiB 响应体传输。
 - outer proxy TLS 使用 `SSL_set_read_ahead` 和 `SSL_set_default_read_buffer_len(256 KiB)` 后，短 profile 中 ylong 的 `recvfrom` 次数从约 12.7k 降至约 5.3k。
 - native fixture 下 `requests=300`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`response=1 MiB` 的 5 次复测为 0/5 达标，ylong 平均约 3378 rps，libcurl 平均约 3613 rps。
-- 因此全部 OKR 不能标记为 100% 完成；下一阶段需要继续优化 async futex/调度开销、连接池 dispatch 热路径和 CONNECT 双层 TLS body drain。
+- 真实 `perf stat` / `perf record` 已完成：`requests=10000` 下 ylong async 平均约 3548 rps，sync 平均约 3522 rps，libcurl 平均约 3823 rps；ylong async/sync 的 top self hotspot 都是 `__memmove_avx_unaligned_erms`，占比约 15% 到 16%，高于 libcurl 的约 5.9%。
+- 因此全部 OKR 不能标记为 100% 完成；下一阶段需要优先降低 CONNECT 双层 TLS body drain 的额外用户态 copy 和 cache 压力，再复测连接池 dispatch 与调度路径。
 
 ## 风险与后续
 

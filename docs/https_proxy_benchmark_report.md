@@ -136,3 +136,75 @@ REPEAT=5 tools/https_proxy_bench/run_https_proxy_bench.sh \
 - 外层 HTTPS proxy TLS 设置 `SSL_set_default_read_buffer_len(256 KiB)`，短 profile 中 ylong `recvfrom` 从约 12.7k 降至约 5.3k。
 - async benchmark 增加 warmup barrier、runtime threads、read buffer、GET request prebuild，避免把建连和请求构造成本混入传输阶段。
 - native fixture 复测显示 `socat` 抖动已基本排除，剩余差距集中在 async futex/调度、连接池 dispatch 和 CONNECT 双层 TLS body drain 热路径。
+
+## Native CONNECT perf profiling
+
+结论：本轮已经完成真实 `perf stat` 和 `perf record` profiling。严格口径仍未达标，且热点不再指向 async-only 调度问题，而是 ylong async/sync 共同的响应读取和内存拷贝路径。
+
+环境：
+
+```text
+git: de2552a
+rustc: rustc 1.95.0 (59807616e 2026-04-14)
+cargo: cargo 1.95.0 (f2d3ce0bd 2026-03-21)
+curl/libcurl: curl 8.18.0 libcurl/8.18.0 OpenSSL/3.5.5
+openssl: OpenSSL 3.5.5 27 Jan 2026
+kernel: Linux aster 7.0.0-14-generic x86_64
+perf: perf version 7.0.0
+perf_event_paranoid: -1
+kptr_restrict: 0
+nmi_watchdog: 0
+```
+
+构建参数：
+
+```bash
+RUSTFLAGS="-C debuginfo=1 -C force-frame-pointers=yes" \
+cargo build -p ylong_http_client --example async_https_proxy_bench \
+  --features "async http1_1 tokio_base c_openssl_3_0" --release
+
+RUSTFLAGS="-C debuginfo=1 -C force-frame-pointers=yes" \
+cargo build -p ylong_http_client --example sync_https_proxy_bench \
+  --features "sync http1_1 tokio_base c_openssl_3_0" --release
+
+cc -O2 -g -fno-omit-frame-pointer -Wall -Wextra -pthread \
+  -o target/https_proxy_bench/libcurl_harness \
+  tools/https_proxy_bench/libcurl_harness.c \
+  $(curl-config --cflags --libs)
+```
+
+`requests=300`、`REPEAT=5` 基线复测：
+
+| Client | 平均 rps | 平均提升 | errors |
+| --- | ---: | ---: | ---: |
+| ylong_http_client async | 3487.151 | -7.9% | 0 |
+| libcurl | 3785.779 | baseline | 0 |
+
+`requests=10000`、`perf stat -r 3` 结果：
+
+| Client | 平均 rps | elapsed | task-clock | cycles | instructions | IPC | L1 miss | context switches |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ylong_http_client async | 3547.965 | 2.893s | 14.944s | 63.878B | 74.626B | 1.168 | 3.895B | 7742 |
+| ylong_http_client sync | 3522.249 | 2.998s | 16.344s | 69.460B | 81.147B | 1.168 | 3.829B | 18938 |
+| libcurl | 3823.429 | 2.685s | 14.667s | 62.391B | 71.905B | 1.153 | 2.279B | 14865 |
+
+`perf record -F 997 -g --call-graph dwarf` 结果：
+
+| Client | requests | samples | rps | p99 | top self hotspots |
+| --- | ---: | ---: | ---: | ---: | --- |
+| ylong_http_client async | 10000 | 16555 | 3531.805 | 34.807ms | `__memmove_avx_unaligned_erms` 16.10%, `_copy_to_iter` 10.09% |
+| ylong_http_client sync | 10000 | 19176 | 3470.777 | 28.701ms | `__memmove_avx_unaligned_erms` 14.90%, `_copy_to_iter` 10.13% |
+| libcurl | 10000 | 16072 | 3765.447 | 25.950ms | `_copy_to_iter` 8.77%, `__memmove_avx_unaligned_erms` 5.87% |
+
+归因：
+
+- ylong async 和 sync 在 10k workload 下都落后于 libcurl，因此当前主要瓶颈不是 Tokio 调度独有问题。
+- ylong 的用户态 `memmove` 占比约为 libcurl 的 2.5 到 2.7 倍，且 L1 data cache miss 明显高于 libcurl，说明响应读取路径存在额外 copy/cache 压力。
+- kernel `_copy_to_iter` 三者都较高，这是 loopback TCP 大 body 读取的共同成本，不是 ylong 独有。
+- libcrypto 热点符号多数来自系统 OpenSSL stripped symbols，当前只能确认 TLS 加解密参与明显；下一步需要用 body/read path 优化先降低 ylong 额外内存拷贝，再复测。
+
+下一阶段优化入口：
+
+- 优先检查 `ylong_http_client/src/async_impl/http_body.rs` 和 `ylong_http_client/src/sync_impl/http_body.rs` 的 `Content-Length` body 读取路径，减少从 stream 到用户 buffer 之间的额外 copy。
+- 检查 CONNECT 双层 TLS 下 `StreamData::poll_read/read` 是否存在中间缓冲复制或较小 read chunk。
+- 优化完成后必须重新运行本节同一组 `perf stat`、`perf record` 和 `REPEAT=5` 正式验收。
