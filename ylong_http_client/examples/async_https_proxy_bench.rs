@@ -12,7 +12,6 @@
 // limitations under the License.
 
 /// HTTPS proxy benchmark client for comparison with libcurl.
-
 use std::env;
 use std::sync::Arc;
 use std::time::Instant;
@@ -46,6 +45,7 @@ struct Config {
     read_buffer_size: usize,
     client_per_worker: bool,
     prebuilt_requests: bool,
+    trace_summary: bool,
     method: String,
     body_size: usize,
     proxy_ca_file: Option<String>,
@@ -63,6 +63,80 @@ struct WorkerResult {
     body_reads: u64,
     errors: usize,
     elapsed_us: u128,
+    trace: TraceSamples,
+}
+
+#[derive(Default)]
+struct TraceSamples {
+    request_ready_us: Vec<u128>,
+    connect_us: Vec<u128>,
+    transfer_us: Vec<u128>,
+    body_first_byte_us: Vec<u128>,
+    body_drain_us: Vec<u128>,
+    body_read_wait_us: Vec<u128>,
+    body_eof_wait_us: Vec<u128>,
+    body_reads_per_request: Vec<u128>,
+    bytes_per_request: Vec<u128>,
+}
+
+impl TraceSamples {
+    fn merge(&mut self, mut other: TraceSamples) {
+        self.request_ready_us.append(&mut other.request_ready_us);
+        self.connect_us.append(&mut other.connect_us);
+        self.transfer_us.append(&mut other.transfer_us);
+        self.body_first_byte_us
+            .append(&mut other.body_first_byte_us);
+        self.body_drain_us.append(&mut other.body_drain_us);
+        self.body_read_wait_us.append(&mut other.body_read_wait_us);
+        self.body_eof_wait_us.append(&mut other.body_eof_wait_us);
+        self.body_reads_per_request
+            .append(&mut other.body_reads_per_request);
+        self.bytes_per_request.append(&mut other.bytes_per_request);
+    }
+
+    fn push(&mut self, trace: ResponseTrace) {
+        self.request_ready_us.push(trace.request_ready_us);
+        if let Some(connect_us) = trace.connect_us {
+            self.connect_us.push(connect_us);
+        }
+        if let Some(transfer_us) = trace.transfer_us {
+            self.transfer_us.push(transfer_us);
+        }
+        if let Some(body_first_byte_us) = trace.body_first_byte_us {
+            self.body_first_byte_us.push(body_first_byte_us);
+        }
+        self.body_drain_us.push(trace.body_drain_us);
+        self.body_read_wait_us.extend(trace.body_read_wait_us);
+        if let Some(body_eof_wait_us) = trace.body_eof_wait_us {
+            self.body_eof_wait_us.push(body_eof_wait_us);
+        }
+        self.body_reads_per_request.push(trace.body_reads as u128);
+        self.bytes_per_request.push(trace.bytes as u128);
+    }
+
+    fn sort(&mut self) {
+        self.request_ready_us.sort_unstable();
+        self.connect_us.sort_unstable();
+        self.transfer_us.sort_unstable();
+        self.body_first_byte_us.sort_unstable();
+        self.body_drain_us.sort_unstable();
+        self.body_read_wait_us.sort_unstable();
+        self.body_eof_wait_us.sort_unstable();
+        self.body_reads_per_request.sort_unstable();
+        self.bytes_per_request.sort_unstable();
+    }
+}
+
+struct ResponseTrace {
+    request_ready_us: u128,
+    connect_us: Option<u128>,
+    transfer_us: Option<u128>,
+    body_first_byte_us: Option<u128>,
+    body_drain_us: u128,
+    body_read_wait_us: Vec<u128>,
+    body_eof_wait_us: Option<u128>,
+    bytes: u64,
+    body_reads: u64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -121,6 +195,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut body_reads = 0;
     let mut errors = 0;
     let mut worker_elapsed_us = Vec::with_capacity(config.concurrency);
+    let mut trace = TraceSamples::default();
     for handle in handles {
         let result = join_worker(handle).await;
         latencies.extend(result.latencies_us);
@@ -130,6 +205,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         if result.elapsed_us != 0 {
             worker_elapsed_us.push(result.elapsed_us);
         }
+        trace.merge(result.trace);
     }
     let elapsed = started.elapsed();
 
@@ -144,7 +220,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(
-        "{{\"client\":\"ylong_http_client\",\"url\":\"{}\",\"proxy\":\"{}\",\"method\":\"{}\",\"body_size\":{},\"requests\":{},\"warmup_requests\":{},\"completed\":{},\"errors\":{},\"concurrency\":{},\"runtime_threads\":{},\"read_buffer_size\":{},\"client_per_worker\":{},\"prebuilt_requests\":{},\"bytes\":{},\"body_reads\":{},\"avg_body_read_size\":{:.3},\"elapsed_ms\":{:.3},\"rps\":{:.3},\"latency_us_p50\":{},\"latency_us_p90\":{},\"latency_us_p95\":{},\"latency_us_p99\":{},\"worker_elapsed_us_min\":{},\"worker_elapsed_us_max\":{}}}",
+        "{{\"client\":\"ylong_http_client\",\"url\":\"{}\",\"proxy\":\"{}\",\"method\":\"{}\",\"body_size\":{},\"requests\":{},\"warmup_requests\":{},\"completed\":{},\"errors\":{},\"concurrency\":{},\"runtime_threads\":{},\"read_buffer_size\":{},\"client_per_worker\":{},\"prebuilt_requests\":{},\"trace_summary\":{},\"bytes\":{},\"body_reads\":{},\"avg_body_read_size\":{:.3},\"elapsed_ms\":{:.3},\"rps\":{:.3},\"latency_us_p50\":{},\"latency_us_p90\":{},\"latency_us_p95\":{},\"latency_us_p99\":{},\"worker_elapsed_us_min\":{},\"worker_elapsed_us_max\":{}}}",
         escape_json(&config.url),
         escape_json(&config.proxy),
         escape_json(&config.method),
@@ -158,6 +234,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         config.read_buffer_size,
         config.client_per_worker,
         config.prebuilt_requests,
+        config.trace_summary,
         bytes,
         body_reads,
         average_read_size(bytes, body_reads),
@@ -170,6 +247,10 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         min_u128(&worker_elapsed_us),
         max_u128(&worker_elapsed_us),
     );
+
+    if config.trace_summary {
+        print_trace_summary(&config, completed, errors, &mut trace, &worker_elapsed_us);
+    }
 
     Ok(())
 }
@@ -333,6 +414,7 @@ async fn run_worker(
                     body_reads: 0,
                     errors: warmup_count + measured_count,
                     elapsed_us: 0,
+                    trace: TraceSamples::default(),
                 };
             }
         },
@@ -343,6 +425,7 @@ async fn run_worker(
         body_reads: 0,
         errors: 0,
         elapsed_us: 0,
+        trace: TraceSamples::default(),
     };
     let mut read_buffer = vec![0; config.read_buffer_size];
 
@@ -353,6 +436,7 @@ async fn run_worker(
             &config.method,
             config.body_size,
             &mut read_buffer,
+            false,
         )
         .await
         .is_err()
@@ -384,11 +468,14 @@ async fn run_worker(
     if let Some(requests) = measured_requests {
         for request in requests {
             let started = Instant::now();
-            match send_request(&client, request, &mut read_buffer).await {
+            match send_request(&client, request, &mut read_buffer, config.trace_summary).await {
                 Ok(stats) => {
                     result.latencies_us.push(started.elapsed().as_micros());
                     result.bytes += stats.bytes;
                     result.body_reads += stats.body_reads;
+                    if let Some(trace) = stats.trace {
+                        result.trace.push(trace);
+                    }
                 }
                 Err(_) => result.errors += 1,
             }
@@ -402,6 +489,7 @@ async fn run_worker(
                 &config.method,
                 config.body_size,
                 &mut read_buffer,
+                config.trace_summary,
             )
             .await
             {
@@ -409,6 +497,9 @@ async fn run_worker(
                     result.latencies_us.push(started.elapsed().as_micros());
                     result.bytes += stats.bytes;
                     result.body_reads += stats.body_reads;
+                    if let Some(trace) = stats.trace {
+                        result.trace.push(trace);
+                    }
                 }
                 Err(_) => result.errors += 1,
             }
@@ -431,6 +522,7 @@ fn build_request(url: &str, method: &str, body_size: usize) -> Result<Request, H
 struct ResponseStats {
     bytes: u64,
     body_reads: u64,
+    trace: Option<ResponseTrace>,
 }
 
 async fn request_once(
@@ -439,17 +531,21 @@ async fn request_once(
     method: &str,
     body_size: usize,
     read_buffer: &mut [u8],
+    trace_summary: bool,
 ) -> Result<ResponseStats, HttpClientError> {
     let request = build_request(url, method, body_size)?;
-    send_request(client, request, read_buffer).await
+    send_request(client, request, read_buffer, trace_summary).await
 }
 
 async fn send_request(
     client: &ylong_http_client::async_impl::Client,
     request: Request,
     read_buffer: &mut [u8],
+    trace_summary: bool,
 ) -> Result<ResponseStats, HttpClientError> {
+    let request_started = Instant::now();
     let mut response = client.request(request).await?;
+    let request_ready_us = request_started.elapsed().as_micros();
     if !response.status().is_successful() {
         return Err(HttpClientError::other(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -457,17 +553,63 @@ async fn send_request(
         )));
     }
 
+    let connect_us = trace_summary
+        .then(|| {
+            response
+                .time_group()
+                .connect_duration()
+                .map(|d| d.as_micros())
+        })
+        .flatten();
+    let transfer_us = trace_summary
+        .then(|| {
+            response
+                .time_group()
+                .transfer_duration()
+                .map(|d| d.as_micros())
+        })
+        .flatten();
+    let body_started = Instant::now();
+    let mut body_first_byte_us = None;
+    let mut body_read_wait_us = Vec::new();
+    let mut body_eof_wait_us = None;
     let mut bytes = 0;
     let mut body_reads = 0;
     loop {
+        let read_started = Instant::now();
         let size = response.data(read_buffer).await?;
+        let read_wait_us = read_started.elapsed().as_micros();
         if size == 0 {
+            if trace_summary {
+                body_eof_wait_us = Some(read_wait_us);
+            }
             break;
+        }
+        if trace_summary {
+            body_read_wait_us.push(read_wait_us);
+            if body_first_byte_us.is_none() {
+                body_first_byte_us = Some(body_started.elapsed().as_micros());
+            }
         }
         bytes += size as u64;
         body_reads += 1;
     }
-    Ok(ResponseStats { bytes, body_reads })
+    let trace = trace_summary.then(|| ResponseTrace {
+        request_ready_us,
+        connect_us,
+        transfer_us,
+        body_first_byte_us,
+        body_drain_us: body_started.elapsed().as_micros(),
+        body_read_wait_us,
+        body_eof_wait_us,
+        bytes,
+        body_reads,
+    });
+    Ok(ResponseStats {
+        bytes,
+        body_reads,
+        trace,
+    })
 }
 
 async fn join_worker(handle: JoinHandle<WorkerResult>) -> WorkerResult {
@@ -479,6 +621,7 @@ async fn join_worker(handle: JoinHandle<WorkerResult>) -> WorkerResult {
             body_reads: 0,
             errors: 1,
             elapsed_us: 0,
+            trace: TraceSamples::default(),
         },
     }
 }
@@ -509,6 +652,55 @@ fn max_u128(values: &[u128]) -> u128 {
     values.iter().copied().max().unwrap_or_default()
 }
 
+fn average_u128(values: &[u128]) -> f64 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<u128>() as f64 / values.len() as f64
+    }
+}
+
+fn print_trace_summary(
+    config: &Config,
+    completed: usize,
+    errors: usize,
+    trace: &mut TraceSamples,
+    worker_elapsed_us: &[u128],
+) {
+    trace.sort();
+    println!(
+        "{{\"kind\":\"request_trace_summary\",\"client\":\"ylong_http_client\",\"url\":\"{}\",\"proxy\":\"{}\",\"completed\":{},\"errors\":{},\"concurrency\":{},\"runtime_threads\":{},\"request_ready_p50_us\":{},\"request_ready_p90_us\":{},\"request_ready_p99_us\":{},\"connect_samples\":{},\"connect_p99_us\":{},\"transfer_samples\":{},\"transfer_p99_us\":{},\"body_first_byte_p99_us\":{},\"body_drain_p50_us\":{},\"body_drain_p90_us\":{},\"body_drain_p99_us\":{},\"body_read_wait_samples\":{},\"body_read_wait_avg_us\":{:.3},\"body_read_wait_p90_us\":{},\"body_read_wait_p99_us\":{},\"body_read_wait_max_us\":{},\"body_eof_wait_p99_us\":{},\"body_reads_per_request_p50\":{},\"body_reads_per_request_p99\":{},\"bytes_per_request_p50\":{},\"worker_elapsed_us_min\":{},\"worker_elapsed_us_max\":{}}}",
+        escape_json(&config.url),
+        escape_json(&config.proxy),
+        completed,
+        errors,
+        config.concurrency,
+        config.runtime_threads,
+        percentile(&trace.request_ready_us, 50),
+        percentile(&trace.request_ready_us, 90),
+        percentile(&trace.request_ready_us, 99),
+        trace.connect_us.len(),
+        percentile(&trace.connect_us, 99),
+        trace.transfer_us.len(),
+        percentile(&trace.transfer_us, 99),
+        percentile(&trace.body_first_byte_us, 99),
+        percentile(&trace.body_drain_us, 50),
+        percentile(&trace.body_drain_us, 90),
+        percentile(&trace.body_drain_us, 99),
+        trace.body_read_wait_us.len(),
+        average_u128(&trace.body_read_wait_us),
+        percentile(&trace.body_read_wait_us, 90),
+        percentile(&trace.body_read_wait_us, 99),
+        max_u128(&trace.body_read_wait_us),
+        percentile(&trace.body_eof_wait_us, 99),
+        percentile(&trace.body_reads_per_request, 50),
+        percentile(&trace.body_reads_per_request, 99),
+        percentile(&trace.bytes_per_request, 50),
+        min_u128(worker_elapsed_us),
+        max_u128(worker_elapsed_us),
+    );
+}
+
 fn parse_args(args: Vec<String>) -> Result<Config, String> {
     let mut config = Config {
         url: String::new(),
@@ -520,6 +712,7 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
         read_buffer_size: 64 * 1024,
         client_per_worker: false,
         prebuilt_requests: false,
+        trace_summary: false,
         method: "GET".to_string(),
         body_size: 0,
         proxy_ca_file: None,
@@ -562,6 +755,7 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
                 )?
             }
             "--client-per-worker" => config.client_per_worker = true,
+            "--trace-summary" => config.trace_summary = true,
             "--method" => config.method = next_value(&mut iter, "--method")?.to_ascii_uppercase(),
             "--body-size" => {
                 config.body_size =
@@ -645,5 +839,5 @@ fn escape_json(value: &str) -> String {
 }
 
 fn usage() -> &'static str {
-    "usage: async_https_proxy_bench --url URL --proxy https://PROXY[:PORT] [--requests N] [--warmup-requests N] [--concurrency N] [--runtime-threads N] [--read-buffer-size N] [--client-per-worker] [--method GET|POST] [--body-size N] [--proxy-ca-file PEM] [--proxy-client-cert PEM] [--proxy-client-key PEM] [--origin-ca-file PEM] [--insecure-proxy] [--insecure-origin] [--proxy-user-pass user:pass]"
+    "usage: async_https_proxy_bench --url URL --proxy https://PROXY[:PORT] [--requests N] [--warmup-requests N] [--concurrency N] [--runtime-threads N] [--read-buffer-size N] [--client-per-worker] [--trace-summary] [--method GET|POST] [--body-size N] [--proxy-ca-file PEM] [--proxy-client-cert PEM] [--proxy-client-key PEM] [--origin-ca-file PEM] [--insecure-proxy] [--insecure-origin] [--proxy-user-pass user:pass]"
 }
