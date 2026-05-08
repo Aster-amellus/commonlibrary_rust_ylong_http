@@ -371,3 +371,62 @@ cargo test -p ylong_http_client --test sdv_sync_https_proxy \
 - `runtime_threads=8` 下平均 ylong 约 3165 rps，libcurl 约 3282 rps，仍未达标。
 - sync client 平均约 2904 rps，低于 async 和 libcurl，不是当前严格 CONNECT 的优先优化对象。
 - 下一步需要继续沿 TLS/BIO read 次数、OpenSSL 内部 buffer、off-CPU scheduler latency、连接池 dispatch 和 per-connection progress 分布 profiling。
+
+## Native CONNECT ylong-runtime 对照
+
+结论：新增 `ylong_base` async benchmark 入口后，ylong runtime 在严格 CONNECT workload 下比 tokio runtime 更接近 libcurl，但仍不能满足 4/5 次 20%+ 的验收口径。runtime 切换不是充分优化。
+
+变更 commit：
+
+```text
+86f985d bench(proxy): add ylong runtime async harness
+```
+
+新增入口：
+
+```bash
+cargo build -p ylong_http_client --example async_ylong_https_proxy_bench \
+  --features "async http1_1 ylong_base c_openssl_3_0" --release
+
+YLONG_CLIENT=async-ylong REPEAT=1 tools/https_proxy_bench/run_https_proxy_bench.sh \
+  --url https://127.0.0.1:38081/ \
+  --proxy https://localhost:38444 \
+  --proxy-ca-file target/https_proxy_bench/certs/ca.pem \
+  --origin-ca-file target/https_proxy_bench/certs/ca.pem \
+  --requests 100 \
+  --warmup-requests 16 \
+  --concurrency 16 \
+  --runtime-threads 8 \
+  --read-buffer-size 65536
+```
+
+`requests=300`、`concurrency=64`、`runtime_threads=16`、`response=1 MiB` 的 3-run probe：
+
+| Run | ylong async-ylong rps | libcurl rps | 提升 | ylong p99 | libcurl p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 3730.592 | 3661.394 | 1.9% | 43.195ms | 23.752ms |
+| 2 | 3798.952 | 3736.083 | 1.7% | 40.307ms | 25.956ms |
+| 3 | 3787.848 | 3752.533 | 0.9% | 34.219ms | 23.535ms |
+
+平均吞吐：
+
+| Client | 平均 rps |
+| --- | ---: |
+| ylong_http_client async-ylong | 3772.464 |
+| libcurl | 3716.670 |
+
+平均提升：1.5%。该 probe 说明 ylong runtime 可缓解部分调度成本，但离 20%+ 目标仍有明显距离，且 p99 仍弱于 libcurl。
+
+TLS/BIO trace 对照：
+
+| Client | SSL_read calls | SSL_read errors | BIO_read calls | BIO_read errors | body_reads |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ylong_http_client async-ylong | 73016 | 1723 | 63352 | 2101 | 19200 |
+| libcurl | 75726 | 2020 | 62076 | 2384 | 19200 |
+
+归因更新：
+
+- ylong runtime 入口下 `SSL_read` 次数不高于 libcurl，当前差距不能简单归因为 ylong 调用更多 OpenSSL read。
+- `BIO_read` 次数仍略高，但差异小于前序 tokio 入口；需要继续结合 off-CPU 和 per-connection progress 观察等待时间，而不是只看 CPU top self。
+- `perf stat` 的 1000-request probe 显示 ylong runtime cycles、instructions、context switches、cache misses 均低于 libcurl 或接近，但 wall time 只小幅领先，说明严格 CONNECT 剩余问题更像尾延迟/调度进度分布问题。
+- 本阶段没有保留 `SSL_pending` ready-drain 或内层 origin TLS read-ahead 试验：两者均未降低 16 KiB body read 粒度，也没有稳定提升吞吐。

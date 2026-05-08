@@ -159,6 +159,22 @@ flowchart TB
     Status --> Next[Next profiling loop<br/>TLS/BIO read counts + off-CPU scheduling + connection progress]
 ```
 
+### P11 ylong runtime 对照后
+
+```mermaid
+flowchart TB
+    Runtime[Async benchmark runtime split] --> Tokio[Tokio runtime harness]
+    Runtime --> YlongRt[ylong runtime harness]
+    YlongRt --> Strict[Native CONNECT strict workload<br/>HTTPS target over HTTPS proxy]
+    Strict --> Trace[TLS/BIO trace]
+    Strict --> Perf[perf stat]
+    Trace --> Finding1[ylong runtime SSL_read not higher than libcurl<br/>73016 vs 75726 in 300-request probe]
+    Perf --> Finding2[ylong runtime cycles/instructions/context-switches lower or close<br/>but wall time/p99 still not 20% better]
+    Finding1 --> Status[O4 remains incomplete]
+    Finding2 --> Status
+    Status --> Next[Next loop<br/>off-CPU scheduler latency + per-connection progress + origin/proxy TLS interaction]
+```
+
 ## M1 TLS 配置补齐
 
 状态：已完成。
@@ -266,8 +282,9 @@ benchmark 场景：
 - 不引入第三方 Rust crate。
 - ylong_http_client 和 libcurl 使用相同 origin/proxy/并发/请求数。
 - `ylong_http_client/examples/async_https_proxy_bench.rs` 负责 ylong 侧请求压测。
+- `ylong_http_client/examples/async_ylong_https_proxy_bench.rs` 复用同一请求逻辑，用 `ylong_base` 构建 ylong runtime 对照入口。
 - `tools/https_proxy_bench/libcurl_harness.c` 负责 libcurl API 对比。
-- `tools/https_proxy_bench/run_https_proxy_bench.sh` 统一构建并运行两侧 workload；输出环境 JSON；`REPEAT=5` 可重复运行；若系统缺少 `curl-config` 或 `cc`，脚本跳过 libcurl 并说明原因。
+- `tools/https_proxy_bench/run_https_proxy_bench.sh` 统一构建并运行两侧 workload；输出环境 JSON；`REPEAT=5` 可重复运行；`YLONG_CLIENT=async|async-ylong|sync|both` 可选择 ylong 侧实现；若系统缺少 `curl-config` 或 `cc`，脚本跳过 libcurl 并说明原因。
 - `tools/https_proxy_bench/local_https_proxy.py` 提供本地 HTTP origin + HTTPS proxy fixture，支持 GET/POST 和固定响应体。
 - `tools/https_proxy_bench/native_proxy_fixture.c` 提供原生 OpenSSL TLS origin + TLS proxy fixture，用于移除 `socat` 包装进程对 CONNECT 高压结果的影响。
 - profiling 使用 `perf stat`、`perf record -g --call-graph dwarf` 或 `/usr/bin/time -v` 包裹同一 workload。
@@ -323,7 +340,9 @@ CONNECT 高压当前结论：
 - 真实 `perf stat` / `perf record` 已完成：`requests=10000` 下 ylong async 平均约 3598 rps，libcurl 平均约 3740 rps；ylong cycles、instructions、cache misses 和 context switches 均低于 libcurl，但 wall time 和 p99 仍落后。
 - 完全关闭 CONNECT 外层 read-ahead 后，ylong async 的 `__memmove_avx_unaligned_erms` top self 从前序 profile 的约 16.10% 降到约 3.84%，但 `strace -f -c` 显示 `recvfrom` 次数明显放大；64 KiB buffer 是当前最优折中。
 - body-read instrumentation 显示 ylong 与 libcurl 的应用层 body drain 都是 16 KiB chunk，严格 CONNECT 未达标不能再归因为 benchmark drain buffer 不一致。
-- 因此下一阶段重点从单纯降低 copy，转为 off-CPU scheduler latency、Tokio task migration、CONNECT 双 TLS 读取次数、TLS/BIO read counter 和 per-connection progress 分布。
+- ylong runtime 对照入口已接入，`requests=300`、`concurrency=64`、`runtime_threads=16` 的 3-run probe 平均约 3772.5 rps，libcurl 平均约 3716.7 rps，仅约 1.5% 提升，未达到 20%。
+- TLS/BIO trace 显示 ylong runtime probe 中 `SSL_read` 次数不高于 libcurl（73016 vs 75726），因此当前严格 CONNECT 差距不能简单归因为 ylong 调用了更多 OpenSSL read。
+- 因此下一阶段重点从单纯降低 copy 或替换 runtime，转为 off-CPU scheduler latency、per-connection progress 分布、CONNECT 双 TLS 读写交互和尾延迟归因。
 - 因此全部 OKR 不能标记为 100% 完成；O4 严格 CONNECT 高压仍未达标。
 
 ## 风险与后续
