@@ -175,6 +175,19 @@ flowchart TB
     Status --> Next[Next loop<br/>off-CPU scheduler latency + per-connection progress + origin/proxy TLS interaction]
 ```
 
+### P12 worker 级进度观测后
+
+```mermaid
+flowchart TB
+    Strict[Native CONNECT strict workload] --> WorkerMetrics[worker_elapsed_us_min/max]
+    WorkerMetrics --> Ylong[ylong async-ylong<br/>max worker elapsed close to wall time]
+    WorkerMetrics --> Curl[libcurl pthread workers<br/>max worker elapsed close to wall time]
+    Ylong --> Tail[ylong request p99 remains higher<br/>worker range alone does not explain gap]
+    Curl --> Tail
+    Tail --> Next[Need finer profiling<br/>per-request connection id + off-CPU sched trace when tracefs is readable]
+    Next --> Status[O4 remains incomplete]
+```
+
 ## M1 TLS 配置补齐
 
 状态：已完成。
@@ -342,7 +355,8 @@ CONNECT 高压当前结论：
 - body-read instrumentation 显示 ylong 与 libcurl 的应用层 body drain 都是 16 KiB chunk，严格 CONNECT 未达标不能再归因为 benchmark drain buffer 不一致。
 - ylong runtime 对照入口已接入，`requests=300`、`concurrency=64`、`runtime_threads=16` 的 3-run probe 平均约 3772.5 rps，libcurl 平均约 3716.7 rps，仅约 1.5% 提升，未达到 20%。
 - TLS/BIO trace 显示 ylong runtime probe 中 `SSL_read` 次数不高于 libcurl（73016 vs 75726），因此当前严格 CONNECT 差距不能简单归因为 ylong 调用了更多 OpenSSL read。
-- 因此下一阶段重点从单纯降低 copy 或替换 runtime，转为 off-CPU scheduler latency、per-connection progress 分布、CONNECT 双 TLS 读写交互和尾延迟归因。
+- worker 级 elapsed range 已接入 ylong/libcurl harness；初步结果显示两者最大 worker elapsed 都接近总 wall time，仍需更细粒度的 connection id / off-CPU trace 才能解释 ylong 更高的 request p99。
+- 因此下一阶段重点从单纯降低 copy 或替换 runtime，转为 off-CPU scheduler latency、per-request connection progress 分布、CONNECT 双 TLS 读写交互和尾延迟归因。
 - 因此全部 OKR 不能标记为 100% 完成；O4 严格 CONNECT 高压仍未达标。
 
 ## 风险与后续

@@ -430,3 +430,30 @@ TLS/BIO trace 对照：
 - `BIO_read` 次数仍略高，但差异小于前序 tokio 入口；需要继续结合 off-CPU 和 per-connection progress 观察等待时间，而不是只看 CPU top self。
 - `perf stat` 的 1000-request probe 显示 ylong runtime cycles、instructions、context switches、cache misses 均低于 libcurl 或接近，但 wall time 只小幅领先，说明严格 CONNECT 剩余问题更像尾延迟/调度进度分布问题。
 - 本阶段没有保留 `SSL_pending` ready-drain 或内层 origin TLS read-ahead 试验：两者均未降低 16 KiB body read 粒度，也没有稳定提升吞吐。
+
+## Native CONNECT worker elapsed instrumentation
+
+结论：新增 worker 级 measured elapsed range 后，能看到 ylong 和 libcurl 的最慢 worker 都基本贴近总 wall time；该指标没有单独解释 ylong request p99 更高的问题。下一步需要更细的 per-request/connection id 或真正的 off-CPU scheduler trace。
+
+变更 commit：
+
+```text
+e75ead5 bench(proxy): report worker elapsed ranges
+```
+
+`requests=300`、`REPEAT=3`、`concurrency=64`、`runtime_threads=16`、`response=1 MiB` 的 probe：
+
+| Run | Client | rps | latency p99 | worker elapsed min | worker elapsed max |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 | ylong async-ylong | 3918.874 | 36.971ms | 36.852ms | 75.930ms |
+| 1 | libcurl | 3617.552 | 24.376ms | 16.923ms | 82.302ms |
+| 2 | ylong async-ylong | 3434.853 | 53.662ms | 33.021ms | 87.232ms |
+| 2 | libcurl | 3503.036 | 26.306ms | 38.135ms | 85.054ms |
+| 3 | ylong async-ylong | 3385.951 | 40.191ms | 35.876ms | 87.744ms |
+| 3 | libcurl | 3637.289 | 23.406ms | 22.245ms | 81.865ms |
+
+观察：
+
+- worker max 与总 elapsed 同量级，说明总吞吐主要受最慢 worker/连接批次收尾影响；这一点 ylong 和 libcurl 都成立。
+- ylong 的 request p99 持续高于 libcurl，但 worker max 没有明显更差，说明问题可能在单连接内的请求完成分布、runtime wake 时机或嵌套 TLS record 读取进度，而不是简单的某个 worker 完全卡死。
+- tracefs sched event 当前仍为 root-only，普通用户无法读取 `/sys/kernel/tracing/events/sched/sched_switch/id`；如需 `perf sched`，需要以 root 运行或放开 tracefs sched event 读权限。
