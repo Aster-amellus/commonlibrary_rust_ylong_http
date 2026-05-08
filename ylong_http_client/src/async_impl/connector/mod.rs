@@ -518,14 +518,8 @@ mod tls {
         let stream = if is_proxy && proxy_scheme == Some(Scheme::HTTPS) {
             let proxy_config = proxy_tls_config.unwrap_or_default();
             let proxy_host = proxy_host.unwrap_or_else(|| addr.clone());
-            let proxy_tls = connect_tls_with_read_ahead(
-                proxy_config,
-                proxy_host.as_str(),
-                tcp,
-                addr.as_str(),
-                true,
-            )
-            .await?;
+            let proxy_tls =
+                connect_tls(proxy_config, proxy_host.as_str(), tcp, addr.as_str()).await?;
             let tunneled = tunnel(proxy_tls, &host, port, auth)
                 .await
                 .map_err(|e| HttpClientError::from_io_error(crate::ErrorKind::Connect, e))?;

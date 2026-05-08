@@ -163,12 +163,11 @@ pub mod tls_conn {
                     if is_proxy && proxy_scheme == Some(Scheme::HTTPS) {
                         let proxy_config = proxy_tls_config.unwrap_or_default();
                         let proxy_host = proxy_host.unwrap_or_else(|| addr.clone());
-                        let proxy_tls = connect_tls_with_read_ahead(
+                        let proxy_tls = connect_tls(
                             &proxy_config,
                             proxy_host.as_str(),
                             tcp_stream,
                             addr.as_str(),
-                            true,
                         )?;
                         let tunneled = tunnel(proxy_tls, host.clone(), port, auth)?;
                         let origin_tls = connect_tls(
