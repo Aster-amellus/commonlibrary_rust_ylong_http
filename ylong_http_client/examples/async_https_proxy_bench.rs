@@ -70,6 +70,8 @@ struct WorkerResult {
 struct TraceSamples {
     request_ready_us: Vec<u128>,
     connect_us: Vec<u128>,
+    request_write_us: Vec<u128>,
+    response_wait_us: Vec<u128>,
     transfer_us: Vec<u128>,
     body_first_byte_us: Vec<u128>,
     body_drain_us: Vec<u128>,
@@ -83,6 +85,8 @@ impl TraceSamples {
     fn merge(&mut self, mut other: TraceSamples) {
         self.request_ready_us.append(&mut other.request_ready_us);
         self.connect_us.append(&mut other.connect_us);
+        self.request_write_us.append(&mut other.request_write_us);
+        self.response_wait_us.append(&mut other.response_wait_us);
         self.transfer_us.append(&mut other.transfer_us);
         self.body_first_byte_us
             .append(&mut other.body_first_byte_us);
@@ -98,6 +102,12 @@ impl TraceSamples {
         self.request_ready_us.push(trace.request_ready_us);
         if let Some(connect_us) = trace.connect_us {
             self.connect_us.push(connect_us);
+        }
+        if let Some(request_write_us) = trace.request_write_us {
+            self.request_write_us.push(request_write_us);
+        }
+        if let Some(response_wait_us) = trace.response_wait_us {
+            self.response_wait_us.push(response_wait_us);
         }
         if let Some(transfer_us) = trace.transfer_us {
             self.transfer_us.push(transfer_us);
@@ -117,6 +127,8 @@ impl TraceSamples {
     fn sort(&mut self) {
         self.request_ready_us.sort_unstable();
         self.connect_us.sort_unstable();
+        self.request_write_us.sort_unstable();
+        self.response_wait_us.sort_unstable();
         self.transfer_us.sort_unstable();
         self.body_first_byte_us.sort_unstable();
         self.body_drain_us.sort_unstable();
@@ -130,6 +142,8 @@ impl TraceSamples {
 struct ResponseTrace {
     request_ready_us: u128,
     connect_us: Option<u128>,
+    request_write_us: Option<u128>,
+    response_wait_us: Option<u128>,
     transfer_us: Option<u128>,
     body_first_byte_us: Option<u128>,
     body_drain_us: u128,
@@ -561,6 +575,22 @@ async fn send_request(
                 .map(|d| d.as_micros())
         })
         .flatten();
+    let request_write_us = trace_summary
+        .then(|| {
+            response
+                .time_group()
+                .request_write_duration()
+                .map(|d| d.as_micros())
+        })
+        .flatten();
+    let response_wait_us = trace_summary
+        .then(|| {
+            response
+                .time_group()
+                .response_wait_duration()
+                .map(|d| d.as_micros())
+        })
+        .flatten();
     let transfer_us = trace_summary
         .then(|| {
             response
@@ -597,6 +627,8 @@ async fn send_request(
     let trace = trace_summary.then(|| ResponseTrace {
         request_ready_us,
         connect_us,
+        request_write_us,
+        response_wait_us,
         transfer_us,
         body_first_byte_us,
         body_drain_us: body_started.elapsed().as_micros(),
@@ -669,7 +701,7 @@ fn print_trace_summary(
 ) {
     trace.sort();
     println!(
-        "{{\"kind\":\"request_trace_summary\",\"client\":\"ylong_http_client\",\"url\":\"{}\",\"proxy\":\"{}\",\"completed\":{},\"errors\":{},\"concurrency\":{},\"runtime_threads\":{},\"request_ready_p50_us\":{},\"request_ready_p90_us\":{},\"request_ready_p99_us\":{},\"connect_samples\":{},\"connect_p99_us\":{},\"transfer_samples\":{},\"transfer_p99_us\":{},\"body_first_byte_p99_us\":{},\"body_drain_p50_us\":{},\"body_drain_p90_us\":{},\"body_drain_p99_us\":{},\"body_read_wait_samples\":{},\"body_read_wait_avg_us\":{:.3},\"body_read_wait_p90_us\":{},\"body_read_wait_p99_us\":{},\"body_read_wait_max_us\":{},\"body_eof_wait_p99_us\":{},\"body_reads_per_request_p50\":{},\"body_reads_per_request_p99\":{},\"bytes_per_request_p50\":{},\"worker_elapsed_us_min\":{},\"worker_elapsed_us_max\":{}}}",
+        "{{\"kind\":\"request_trace_summary\",\"client\":\"ylong_http_client\",\"url\":\"{}\",\"proxy\":\"{}\",\"completed\":{},\"errors\":{},\"concurrency\":{},\"runtime_threads\":{},\"request_ready_p50_us\":{},\"request_ready_p90_us\":{},\"request_ready_p99_us\":{},\"connect_samples\":{},\"connect_p99_us\":{},\"request_write_samples\":{},\"request_write_p99_us\":{},\"response_wait_samples\":{},\"response_wait_p99_us\":{},\"transfer_samples\":{},\"transfer_p99_us\":{},\"body_first_byte_p99_us\":{},\"body_drain_p50_us\":{},\"body_drain_p90_us\":{},\"body_drain_p99_us\":{},\"body_read_wait_samples\":{},\"body_read_wait_avg_us\":{:.3},\"body_read_wait_p90_us\":{},\"body_read_wait_p99_us\":{},\"body_read_wait_max_us\":{},\"body_eof_wait_p99_us\":{},\"body_reads_per_request_p50\":{},\"body_reads_per_request_p99\":{},\"bytes_per_request_p50\":{},\"worker_elapsed_us_min\":{},\"worker_elapsed_us_max\":{}}}",
         escape_json(&config.url),
         escape_json(&config.proxy),
         completed,
@@ -681,6 +713,10 @@ fn print_trace_summary(
         percentile(&trace.request_ready_us, 99),
         trace.connect_us.len(),
         percentile(&trace.connect_us, 99),
+        trace.request_write_us.len(),
+        percentile(&trace.request_write_us, 99),
+        trace.response_wait_us.len(),
+        percentile(&trace.response_wait_us, 99),
         trace.transfer_us.len(),
         percentile(&trace.transfer_us, 99),
         percentile(&trace.body_first_byte_us, 99),

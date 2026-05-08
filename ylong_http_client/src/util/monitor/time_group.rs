@@ -40,6 +40,10 @@ pub struct TimeGroup {
     conn_duration: Option<Duration>,
     // start send bytes to peer.
     transfer_start: Option<Instant>,
+    // request headers and body were written to peer.
+    request_write_end: Option<Instant>,
+    request_write_duration: Option<Duration>,
+    response_wait_duration: Option<Duration>,
     // received first byte from peer.
     transfer_end: Option<Instant>,
     transfer_duration: Option<Duration>,
@@ -102,7 +106,17 @@ impl TimeGroup {
         if let Some(start) = self.transfer_start {
             self.transfer_duration = end.checked_duration_since(start)
         }
+        if let Some(write_end) = self.request_write_end {
+            self.response_wait_duration = end.checked_duration_since(write_end)
+        }
         self.transfer_end = Some(end)
+    }
+
+    pub(crate) fn set_request_write_end(&mut self, end: Instant) {
+        if let Some(start) = self.transfer_start {
+            self.request_write_duration = end.checked_duration_since(start)
+        }
+        self.request_write_end = Some(end)
     }
 
     pub(crate) fn set_connect_start(&mut self, start: Instant) {
@@ -182,6 +196,18 @@ impl TimeGroup {
         self.conn_duration = duration
     }
 
+    pub(crate) fn update_request_write_end(&mut self, end: Option<Instant>) {
+        self.request_write_end = end
+    }
+
+    pub(crate) fn update_request_write_duration(&mut self, duration: Option<Duration>) {
+        self.request_write_duration = duration
+    }
+
+    pub(crate) fn update_response_wait_duration(&mut self, duration: Option<Duration>) {
+        self.response_wait_duration = duration
+    }
+
     pub(crate) fn update_transport_conn_time(&mut self, time_group: &TimeGroup) {
         self.update_dns_start(time_group.dns_start_time());
         self.update_dns_end(time_group.dns_end_time());
@@ -212,6 +238,9 @@ impl TimeGroup {
         self.update_connection_start(time_group.connect_start_time());
         self.update_connection_end(time_group.connect_end_time());
         self.update_connection_duration(time_group.connect_duration());
+        self.update_request_write_end(time_group.request_write_end_time());
+        self.update_request_write_duration(time_group.request_write_duration());
+        self.update_response_wait_duration(time_group.response_wait_duration());
     }
 
     /// Gets the  point in time when the tcp connection starts to be
@@ -298,6 +327,21 @@ impl TimeGroup {
     /// received.
     pub fn transfer_duration(&self) -> Option<Duration> {
         self.transfer_duration
+    }
+
+    /// Gets the point in time when the request was written.
+    pub fn request_write_end_time(&self) -> Option<Instant> {
+        self.request_write_end
+    }
+
+    /// Gets the time it takes to write request headers and body.
+    pub fn request_write_duration(&self) -> Option<Duration> {
+        self.request_write_duration
+    }
+
+    /// Gets the time from request write completion to first response byte.
+    pub fn response_wait_duration(&self) -> Option<Duration> {
+        self.response_wait_duration
     }
 
     /// Gets the point in time to start establishing the request connection.

@@ -64,6 +64,11 @@ where
     )
     .await?;
     encode_various_body(message.request.ref_mut(), &mut conn, &mut buf).await?;
+    message
+        .request
+        .ref_mut()
+        .time_group_mut()
+        .set_request_write_end(Instant::now());
     // Decodes response part.
     let (part, pre) = {
         let mut decoder = ResponseDecoder::new();
