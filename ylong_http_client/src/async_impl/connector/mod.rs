@@ -282,7 +282,10 @@ mod tls {
     use crate::async_impl::connector::dns_query;
     use crate::async_impl::connector::stream::HttpStream;
     use crate::async_impl::mix::MixStream;
-    use crate::async_impl::proxy::{connect_tls, connect_tls_with_read_ahead, tunnel};
+    use crate::async_impl::proxy::{
+        connect_tls, connect_tls_with_read_ahead, connect_tls_with_read_ahead_buffer, tunnel,
+        CONNECT_PROXY_READ_AHEAD_BUFFER,
+    };
     #[cfg(feature = "http3")]
     use crate::async_impl::quic::QuicConn;
     use crate::runtime::TcpStream;
@@ -518,8 +521,14 @@ mod tls {
         let stream = if is_proxy && proxy_scheme == Some(Scheme::HTTPS) {
             let proxy_config = proxy_tls_config.unwrap_or_default();
             let proxy_host = proxy_host.unwrap_or_else(|| addr.clone());
-            let proxy_tls =
-                connect_tls(proxy_config, proxy_host.as_str(), tcp, addr.as_str()).await?;
+            let proxy_tls = connect_tls_with_read_ahead_buffer(
+                proxy_config,
+                proxy_host.as_str(),
+                tcp,
+                addr.as_str(),
+                CONNECT_PROXY_READ_AHEAD_BUFFER,
+            )
+            .await?;
             let tunneled = tunnel(proxy_tls, &host, port, auth)
                 .await
                 .map_err(|e| HttpClientError::from_io_error(crate::ErrorKind::Connect, e))?;

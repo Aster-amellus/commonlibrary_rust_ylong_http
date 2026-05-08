@@ -18,6 +18,9 @@ use std::io::{Read, Write};
 use crate::util::c_openssl::ssl::SslStream;
 use crate::{ErrorKind, HttpClientError, TlsConfig};
 
+pub(crate) const DEFAULT_READ_AHEAD_BUFFER: usize = 256 * 1024;
+pub(crate) const CONNECT_PROXY_READ_AHEAD_BUFFER: usize = 64 * 1024;
+
 pub(crate) fn connect_tls<S>(
     config: &TlsConfig,
     domain: &str,
@@ -30,6 +33,19 @@ where
     connect_tls_with_read_ahead(config, domain, stream, pin_host, false)
 }
 
+pub(crate) fn connect_tls_with_read_ahead_buffer<S>(
+    config: &TlsConfig,
+    domain: &str,
+    stream: S,
+    pin_host: &str,
+    read_buffer_len: usize,
+) -> Result<SslStream<S>, HttpClientError>
+where
+    S: Read + Write,
+{
+    connect_tls_inner(config, domain, stream, pin_host, Some(read_buffer_len))
+}
+
 pub(crate) fn connect_tls_with_read_ahead<S>(
     config: &TlsConfig,
     domain: &str,
@@ -40,15 +56,29 @@ pub(crate) fn connect_tls_with_read_ahead<S>(
 where
     S: Read + Write,
 {
+    let read_buffer_len = read_ahead.then_some(DEFAULT_READ_AHEAD_BUFFER);
+    connect_tls_inner(config, domain, stream, pin_host, read_buffer_len)
+}
+
+fn connect_tls_inner<S>(
+    config: &TlsConfig,
+    domain: &str,
+    stream: S,
+    pin_host: &str,
+    read_buffer_len: Option<usize>,
+) -> Result<SslStream<S>, HttpClientError>
+where
+    S: Read + Write,
+{
     let pinned_key = config.pinning_host_match(pin_host);
     let mut ssl = config
         .ssl_new(domain)
         .map(|ssl| ssl.into_inner())
         .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
     #[cfg(feature = "__c_openssl")]
-    if read_ahead {
+    if let Some(len) = read_buffer_len {
         ssl.set_read_ahead(true);
-        ssl.set_default_read_buffer_len(256 * 1024);
+        ssl.set_default_read_buffer_len(len);
     }
     let mut stream = SslStream::new_base(ssl, stream, pinned_key)
         .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;

@@ -22,6 +22,9 @@ use crate::async_impl::ssl_stream::AsyncSslStream;
 use crate::runtime::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::{HttpClientError, TlsConfig};
 
+pub(crate) const DEFAULT_READ_AHEAD_BUFFER: usize = 256 * 1024;
+pub(crate) const CONNECT_PROXY_READ_AHEAD_BUFFER: usize = 64 * 1024;
+
 pub(crate) async fn connect_tls<S>(
     config: TlsConfig,
     domain: &str,
@@ -34,6 +37,19 @@ where
     connect_tls_with_read_ahead(config, domain, stream, pin_host, false).await
 }
 
+pub(crate) async fn connect_tls_with_read_ahead_buffer<S>(
+    config: TlsConfig,
+    domain: &str,
+    stream: S,
+    pin_host: &str,
+    read_buffer_len: usize,
+) -> Result<AsyncSslStream<S>, HttpClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    connect_tls_inner(config, domain, stream, pin_host, Some(read_buffer_len)).await
+}
+
 pub(crate) async fn connect_tls_with_read_ahead<S>(
     config: TlsConfig,
     domain: &str,
@@ -44,15 +60,29 @@ pub(crate) async fn connect_tls_with_read_ahead<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let read_buffer_len = read_ahead.then_some(DEFAULT_READ_AHEAD_BUFFER);
+    connect_tls_inner(config, domain, stream, pin_host, read_buffer_len).await
+}
+
+async fn connect_tls_inner<S>(
+    config: TlsConfig,
+    domain: &str,
+    stream: S,
+    pin_host: &str,
+    read_buffer_len: Option<usize>,
+) -> Result<AsyncSslStream<S>, HttpClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let pinned_key = config.pinning_host_match(pin_host);
     let mut stream = config
         .ssl_new(domain)
         .and_then(|ssl| {
             let mut ssl = ssl.into_inner();
             #[cfg(feature = "__c_openssl")]
-            if read_ahead {
+            if let Some(len) = read_buffer_len {
                 ssl.set_read_ahead(true);
-                ssl.set_default_read_buffer_len(256 * 1024);
+                ssl.set_default_read_buffer_len(len);
             }
             AsyncSslStream::new(ssl, stream, pinned_key)
         })
