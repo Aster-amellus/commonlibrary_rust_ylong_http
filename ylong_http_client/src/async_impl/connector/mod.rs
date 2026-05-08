@@ -282,7 +282,7 @@ mod tls {
     use crate::async_impl::connector::dns_query;
     use crate::async_impl::connector::stream::HttpStream;
     use crate::async_impl::mix::MixStream;
-    use crate::async_impl::proxy::{connect_tls, tunnel};
+    use crate::async_impl::proxy::{connect_tls, connect_tls_with_read_ahead, tunnel};
     #[cfg(feature = "http3")]
     use crate::async_impl::quic::QuicConn;
     use crate::runtime::TcpStream;
@@ -369,7 +369,9 @@ mod tls {
                         let config = proxy_tls_config.unwrap_or_default();
                         let host = proxy_host.as_deref().unwrap_or(addr.as_str());
                         time_group.set_tls_start(Instant::now());
-                        let stream = connect_tls(config, host, stream, addr.as_str()).await?;
+                        let stream =
+                            connect_tls_with_read_ahead(config, host, stream, addr.as_str(), true)
+                                .await?;
                         time_group.set_tls_end(Instant::now());
                         MixStream::ProxyHttps(stream)
                     } else {
@@ -516,8 +518,14 @@ mod tls {
         let stream = if is_proxy && proxy_scheme == Some(Scheme::HTTPS) {
             let proxy_config = proxy_tls_config.unwrap_or_default();
             let proxy_host = proxy_host.unwrap_or_else(|| addr.clone());
-            let proxy_tls =
-                connect_tls(proxy_config, proxy_host.as_str(), tcp, addr.as_str()).await?;
+            let proxy_tls = connect_tls_with_read_ahead(
+                proxy_config,
+                proxy_host.as_str(),
+                tcp,
+                addr.as_str(),
+                true,
+            )
+            .await?;
             let tunneled = tunnel(proxy_tls, &host, port, auth)
                 .await
                 .map_err(|e| HttpClientError::from_io_error(crate::ErrorKind::Connect, e))?;
@@ -577,8 +585,8 @@ mod tls {
         use ylong_runtime::io::AsyncWriteExt;
 
         use crate::async_impl::connector::tcp_stream;
-        use crate::async_impl::proxy::{other_io_error, tunnel, CreateTunnelErr};
         use crate::async_impl::dns::{EyeBallConfig, HappyEyeballs};
+        use crate::async_impl::proxy::{other_io_error, tunnel, CreateTunnelErr};
         use crate::start_tcp_server;
         use crate::util::test_utils::{format_header_str, TcpHandle};
 

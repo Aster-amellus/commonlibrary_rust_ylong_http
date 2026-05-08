@@ -27,11 +27,30 @@ pub(crate) fn connect_tls<S>(
 where
     S: Read + Write,
 {
+    connect_tls_with_read_ahead(config, domain, stream, pin_host, false)
+}
+
+pub(crate) fn connect_tls_with_read_ahead<S>(
+    config: &TlsConfig,
+    domain: &str,
+    stream: S,
+    pin_host: &str,
+    read_ahead: bool,
+) -> Result<SslStream<S>, HttpClientError>
+where
+    S: Read + Write,
+{
     let pinned_key = config.pinning_host_match(pin_host);
-    let ssl = config
+    let mut ssl = config
         .ssl_new(domain)
+        .map(|ssl| ssl.into_inner())
         .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
-    let mut stream = SslStream::new_base(ssl.into_inner(), stream, pinned_key)
+    #[cfg(feature = "__c_openssl")]
+    if read_ahead {
+        ssl.set_read_ahead(true);
+        ssl.set_default_read_buffer_len(256 * 1024);
+    }
+    let mut stream = SslStream::new_base(ssl, stream, pinned_key)
         .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
     stream
         .connect()

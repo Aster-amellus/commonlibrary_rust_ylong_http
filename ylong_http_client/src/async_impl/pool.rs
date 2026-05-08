@@ -431,19 +431,9 @@ impl<S: AsyncRead + AsyncWrite + ConnInfo + Unpin + Send + Sync + 'static> Conns
 
     fn exist_h1_conn(&self, permit: WrappedSemPermit) -> H1ConnOption<Conn<S>> {
         let mut list = self.list.lock().unwrap();
-        let mut conn = None;
-        let curr = take(&mut *list);
         // TODO Distinguish between http2 connections and http1 connections.
-        for dispatcher in curr.into_iter() {
-            // Discard invalid dispatchers.
-            if dispatcher.is_shutdown() {
-                continue;
-            }
-            if conn.is_none() {
-                conn = dispatcher.dispatch();
-            }
-            list.push(dispatcher);
-        }
+        list.retain(|dispatcher| !dispatcher.is_shutdown());
+        let conn = list.iter().find_map(|dispatcher| dispatcher.dispatch());
         match conn {
             Some(Conn::Http1(mut h1)) => {
                 h1.occupy_sem(permit);

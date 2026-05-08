@@ -97,7 +97,7 @@ pub mod tls_conn {
 
     use ylong_http::request::uri::{Scheme, Uri};
 
-    use crate::sync_impl::proxy::{connect_tls, tunnel};
+    use crate::sync_impl::proxy::{connect_tls, connect_tls_with_read_ahead, tunnel};
     use crate::sync_impl::{Connector, MixStream};
     use crate::util::pool::PoolKey;
     use crate::{ErrorKind, HttpClientError};
@@ -138,11 +138,12 @@ pub mod tls_conn {
                     if is_proxy && proxy_scheme == Some(Scheme::HTTPS) {
                         let proxy_config = proxy_tls_config.unwrap_or_default();
                         let proxy_host = proxy_host.unwrap_or_else(|| addr.clone());
-                        let proxy_tls = connect_tls(
+                        let proxy_tls = connect_tls_with_read_ahead(
                             &proxy_config,
                             proxy_host.as_str(),
                             tcp_stream,
                             addr.as_str(),
+                            true,
                         )?;
                         Ok(MixStream::ProxyHttps(proxy_tls))
                     } else {
@@ -156,11 +157,12 @@ pub mod tls_conn {
                     if is_proxy && proxy_scheme == Some(Scheme::HTTPS) {
                         let proxy_config = proxy_tls_config.unwrap_or_default();
                         let proxy_host = proxy_host.unwrap_or_else(|| addr.clone());
-                        let proxy_tls = connect_tls(
+                        let proxy_tls = connect_tls_with_read_ahead(
                             &proxy_config,
                             proxy_host.as_str(),
                             tcp_stream,
                             addr.as_str(),
+                            true,
                         )?;
                         let tunneled = tunnel(proxy_tls, host.clone(), port, auth)?;
                         let origin_tls = connect_tls(

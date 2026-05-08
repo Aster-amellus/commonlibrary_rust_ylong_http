@@ -76,6 +76,10 @@ impl SpeedController {
         self.recv_rate_limit.delay_max_speed_limit(size)
     }
 
+    pub(crate) fn is_recv_unlimited(&self) -> bool {
+        self.recv_rate_limit.is_unlimited()
+    }
+
     #[cfg(any(feature = "http2", feature = "http3"))]
     pub(crate) fn delay_max_send_speed_limit(&mut self, size: usize) {
         self.send_rate_limit.delay_max_speed_limit(size)
@@ -150,6 +154,10 @@ impl RateLimit {
 
     pub(crate) fn need_limit_max_speed(&self) -> bool {
         self.max_speed.is_some()
+    }
+
+    pub(crate) fn is_unlimited(&self) -> bool {
+        self.min_speed.is_none() && self.max_speed.is_none()
     }
 
     pub(crate) fn init_max_limit_if_not_start(&mut self) {

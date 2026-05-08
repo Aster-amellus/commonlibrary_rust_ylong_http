@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use libc::{c_char, c_int, c_long, c_uchar, c_uint, c_void};
+use libc::{c_char, c_int, c_long, c_uchar, c_uint, c_void, size_t};
 
 use super::bio::BIO;
 use super::x509::{C_X509, STACK_X509, X509_STORE, X509_STORE_CTX, X509_VERIFY_PARAM};
@@ -200,6 +200,12 @@ extern "C" {
     pub(crate) fn SSL_set_bio(ssl: *mut SSL, rbio: *mut BIO, wbio: *mut BIO);
 
     pub(crate) fn SSL_get_rbio(ssl: *const SSL) -> *mut BIO;
+
+    #[cfg(feature = "__c_openssl")]
+    pub(crate) fn SSL_set_read_ahead(ssl: *mut SSL, yes: c_int);
+
+    #[cfg(feature = "__c_openssl")]
+    pub(crate) fn SSL_set_default_read_buffer_len(ssl: *mut SSL, len: size_t);
 
     pub(crate) fn SSL_read(ssl: *mut SSL, buf: *mut c_void, num: c_int) -> c_int;
 

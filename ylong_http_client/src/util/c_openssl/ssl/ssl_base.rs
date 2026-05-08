@@ -29,6 +29,8 @@ use crate::c_openssl::ffi::ssl::{
     SSL_get0_param, SSL_get_error, SSL_get_rbio, SSL_get_verify_result, SSL_read,
     SSL_state_string_long, SSL_write,
 };
+#[cfg(feature = "__c_openssl")]
+use crate::c_openssl::ffi::ssl::{SSL_set_default_read_buffer_len, SSL_set_read_ahead};
 use crate::c_openssl::foreign::ForeignRef;
 use crate::c_openssl::x509::{
     X509VerifyParamRef, X509VerifyResult, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS,
@@ -110,6 +112,16 @@ impl SslRef {
 
     pub(crate) fn get_raw_bio(&self) -> *mut BIO {
         unsafe { SSL_get_rbio(self.as_ptr()) }
+    }
+
+    #[cfg(feature = "__c_openssl")]
+    pub(crate) fn set_read_ahead(&mut self, enabled: bool) {
+        unsafe { SSL_set_read_ahead(self.as_ptr(), enabled as c_int) };
+    }
+
+    #[cfg(feature = "__c_openssl")]
+    pub(crate) fn set_default_read_buffer_len(&mut self, len: usize) {
+        unsafe { SSL_set_default_read_buffer_len(self.as_ptr(), len) };
     }
 
     pub(crate) fn read(&mut self, buf: &[u8]) -> c_int {

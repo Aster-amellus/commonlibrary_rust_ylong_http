@@ -372,6 +372,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for Http1Conn<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        if self.speed_controller.is_recv_unlimited() {
+            return Pin::new(self.raw_mut()).poll_read(cx, buf);
+        }
+
         if self.speed_controller.poll_recv_pending_timeout(cx) {
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,

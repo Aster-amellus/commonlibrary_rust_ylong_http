@@ -31,10 +31,31 @@ pub(crate) async fn connect_tls<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    connect_tls_with_read_ahead(config, domain, stream, pin_host, false).await
+}
+
+pub(crate) async fn connect_tls_with_read_ahead<S>(
+    config: TlsConfig,
+    domain: &str,
+    stream: S,
+    pin_host: &str,
+    read_ahead: bool,
+) -> Result<AsyncSslStream<S>, HttpClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let pinned_key = config.pinning_host_match(pin_host);
     let mut stream = config
         .ssl_new(domain)
-        .and_then(|ssl| AsyncSslStream::new(ssl.into_inner(), stream, pinned_key))
+        .and_then(|ssl| {
+            let mut ssl = ssl.into_inner();
+            #[cfg(feature = "__c_openssl")]
+            if read_ahead {
+                ssl.set_read_ahead(true);
+                ssl.set_default_read_buffer_len(256 * 1024);
+            }
+            AsyncSslStream::new(ssl, stream, pinned_key)
+        })
         .map_err(|e| {
             HttpClientError::from_tls_error(
                 crate::ErrorKind::Connect,
@@ -43,10 +64,7 @@ where
         })?;
 
     Pin::new(&mut stream).connect().await.map_err(|e| {
-        HttpClientError::from_tls_error(
-            crate::ErrorKind::Connect,
-            Error::new(ErrorKind::Other, e),
-        )
+        HttpClientError::from_tls_error(crate::ErrorKind::Connect, Error::new(ErrorKind::Other, e))
     })?;
     Ok(stream)
 }
