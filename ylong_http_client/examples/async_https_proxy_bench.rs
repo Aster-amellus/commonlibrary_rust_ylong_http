@@ -11,15 +11,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! HTTPS proxy benchmark client for comparison with libcurl.
+/// HTTPS proxy benchmark client for comparison with libcurl.
 
 use std::env;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(all(feature = "tokio_base", not(feature = "ylong_base")))]
 use tokio::runtime::Builder;
+#[cfg(all(feature = "tokio_base", not(feature = "ylong_base")))]
 use tokio::sync::Barrier;
+#[cfg(all(feature = "tokio_base", not(feature = "ylong_base")))]
 use tokio::task::JoinHandle;
+#[cfg(all(feature = "ylong_base", not(feature = "tokio_base")))]
+use ylong_runtime::builder::RuntimeBuilder;
+#[cfg(all(feature = "ylong_base", not(feature = "tokio_base")))]
+use ylong_runtime::sync::{mpsc, Waiter};
+#[cfg(all(feature = "ylong_base", not(feature = "tokio_base")))]
+use ylong_runtime::task::JoinHandle;
 
 use ylong_http_client::async_impl::{Body, ClientBuilder, Request};
 use ylong_http_client::{HttpClientError, Proxy, TlsConfig, TlsFileType};
@@ -65,11 +74,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let runtime = Builder::new_multi_thread()
-        .worker_threads(config.runtime_threads)
-        .enable_all()
-        .build()?;
-    runtime.block_on(run(config))
+    #[cfg(all(feature = "tokio_base", not(feature = "ylong_base")))]
+    {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(config.runtime_threads)
+            .enable_all()
+            .build()?;
+        runtime.block_on(run(config))
+    }
+
+    #[cfg(all(feature = "ylong_base", not(feature = "tokio_base")))]
+    {
+        RuntimeBuilder::new_multi_thread()
+            .worker_num(config.runtime_threads)
+            .build_global()?;
+        ylong_runtime::block_on(run(config))
+    }
 }
 
 async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -80,19 +100,19 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         Some(Arc::new(build_client(&config)?))
     };
     let mut handles = Vec::with_capacity(config.concurrency);
-    let barrier = Arc::new(Barrier::new(config.concurrency + 1));
+    let mut start = StartCoordinator::new(config.concurrency);
     for worker in 0..config.concurrency {
         let measured_count = requests_for_worker(config.requests, config.concurrency, worker);
         let warmup_count = requests_for_worker(config.warmup_requests, config.concurrency, worker);
         let client = shared_client.clone();
         let config = config.clone();
-        let barrier = barrier.clone();
-        handles.push(tokio::spawn(async move {
-            run_worker(client, config, warmup_count, measured_count, barrier).await
+        let gate = start.worker_gate();
+        handles.push(spawn_worker(async move {
+            run_worker(client, config, warmup_count, measured_count, gate).await
         }));
     }
 
-    barrier.wait().await;
+    start.wait_all().await;
     let started = Instant::now();
 
     let mut latencies = Vec::with_capacity(config.requests);
@@ -147,6 +167,104 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(all(feature = "tokio_base", not(feature = "ylong_base")))]
+type StartGate = Arc<Barrier>;
+
+#[cfg(all(feature = "tokio_base", not(feature = "ylong_base")))]
+struct StartCoordinator {
+    barrier: Arc<Barrier>,
+}
+
+#[cfg(all(feature = "tokio_base", not(feature = "ylong_base")))]
+impl StartCoordinator {
+    fn new(workers: usize) -> Self {
+        Self {
+            barrier: Arc::new(Barrier::new(workers + 1)),
+        }
+    }
+
+    fn worker_gate(&self) -> StartGate {
+        self.barrier.clone()
+    }
+
+    async fn wait_all(&mut self) {
+        self.barrier.wait().await;
+    }
+}
+
+#[cfg(all(feature = "tokio_base", not(feature = "ylong_base")))]
+async fn worker_ready_and_wait(gate: StartGate) {
+    gate.wait().await;
+}
+
+#[cfg(all(feature = "tokio_base", not(feature = "ylong_base")))]
+fn spawn_worker<F>(future: F) -> JoinHandle<WorkerResult>
+where
+    F: std::future::Future<Output = WorkerResult> + Send + 'static,
+{
+    tokio::spawn(future)
+}
+
+#[cfg(all(feature = "ylong_base", not(feature = "tokio_base")))]
+#[derive(Clone)]
+struct StartGate {
+    ready_tx: mpsc::UnboundedSender<()>,
+    start: Arc<Waiter>,
+}
+
+#[cfg(all(feature = "ylong_base", not(feature = "tokio_base")))]
+struct StartCoordinator {
+    workers: usize,
+    ready_rx: mpsc::UnboundedReceiver<()>,
+    ready_tx: mpsc::UnboundedSender<()>,
+    start: Arc<Waiter>,
+}
+
+#[cfg(all(feature = "ylong_base", not(feature = "tokio_base")))]
+impl StartCoordinator {
+    fn new(workers: usize) -> Self {
+        let (ready_tx, ready_rx) = mpsc::unbounded_channel();
+        Self {
+            workers,
+            ready_rx,
+            ready_tx,
+            start: Arc::new(Waiter::new()),
+        }
+    }
+
+    fn worker_gate(&self) -> StartGate {
+        StartGate {
+            ready_tx: self.ready_tx.clone(),
+            start: self.start.clone(),
+        }
+    }
+
+    async fn wait_all(&mut self) {
+        for _ in 0..self.workers {
+            if self.ready_rx.recv().await.is_err() {
+                break;
+            }
+        }
+        for _ in 0..self.workers {
+            self.start.wake_one();
+        }
+    }
+}
+
+#[cfg(all(feature = "ylong_base", not(feature = "tokio_base")))]
+async fn worker_ready_and_wait(gate: StartGate) {
+    let _ = gate.ready_tx.send(());
+    gate.start.wait().await;
+}
+
+#[cfg(all(feature = "ylong_base", not(feature = "tokio_base")))]
+fn spawn_worker<F>(future: F) -> JoinHandle<WorkerResult>
+where
+    F: std::future::Future<Output = WorkerResult> + Send + 'static,
+{
+    ylong_runtime::spawn(future)
+}
+
 fn build_client(config: &Config) -> Result<ylong_http_client::async_impl::Client, HttpClientError> {
     let mut proxy_tls = TlsConfig::builder();
     if let Some(path) = &config.proxy_ca_file {
@@ -194,14 +312,14 @@ async fn run_worker(
     config: Arc<Config>,
     warmup_count: usize,
     measured_count: usize,
-    barrier: Arc<Barrier>,
+    gate: StartGate,
 ) -> WorkerResult {
     let client = match client {
         Some(client) => client,
         None => match build_client(&config) {
             Ok(client) => Arc::new(client),
             Err(_) => {
-                barrier.wait().await;
+                worker_ready_and_wait(gate).await;
                 return WorkerResult {
                     latencies_us: Vec::new(),
                     bytes: 0,
@@ -241,7 +359,7 @@ async fn run_worker(
                 Ok(request) => requests.push(request),
                 Err(_) => {
                     result.errors += measured_count;
-                    barrier.wait().await;
+                    worker_ready_and_wait(gate).await;
                     return result;
                 }
             }
@@ -251,7 +369,7 @@ async fn run_worker(
         None
     };
 
-    barrier.wait().await;
+    worker_ready_and_wait(gate).await;
 
     if let Some(requests) = measured_requests {
         for request in requests {

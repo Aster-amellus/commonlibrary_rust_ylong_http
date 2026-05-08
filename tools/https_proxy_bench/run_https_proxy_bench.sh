@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "$0")/../.." && pwd)
 OUT_DIR="$ROOT_DIR/target/https_proxy_bench"
 YLONG_ASYNC_BIN="$ROOT_DIR/target/release/examples/async_https_proxy_bench"
+YLONG_ASYNC_YLONG_BIN="$ROOT_DIR/target/release/examples/async_ylong_https_proxy_bench"
 YLONG_SYNC_BIN="$ROOT_DIR/target/release/examples/sync_https_proxy_bench"
 CURL_BIN="$OUT_DIR/libcurl_harness"
 
@@ -34,7 +35,7 @@ ylong-only options:
 
 Profiling:
   REPEAT=N          run each client N times
-  YLONG_CLIENT=async|sync|both
+  YLONG_CLIENT=async|async-ylong|sync|both
   BENCH_ORDER=paired|grouped
   PROFILE=time      run each client under /usr/bin/time -v when available
   PROFILE=perf-stat run each client under perf stat when available
@@ -48,6 +49,10 @@ case "$YLONG_CLIENT" in
         cargo build -p ylong_http_client --example async_https_proxy_bench \
             --features "async http1_1 tokio_base c_openssl_3_0" --release
         ;;
+    async-ylong)
+        cargo build -p ylong_http_client --example async_ylong_https_proxy_bench \
+            --features "async http1_1 ylong_base c_openssl_3_0" --release
+        ;;
     sync)
         cargo build -p ylong_http_client --example sync_https_proxy_bench \
             --features "sync http1_1 tokio_base c_openssl_3_0" --release
@@ -55,11 +60,13 @@ case "$YLONG_CLIENT" in
     both)
         cargo build -p ylong_http_client --example async_https_proxy_bench \
             --features "async http1_1 tokio_base c_openssl_3_0" --release
+        cargo build -p ylong_http_client --example async_ylong_https_proxy_bench \
+            --features "async http1_1 ylong_base c_openssl_3_0" --release
         cargo build -p ylong_http_client --example sync_https_proxy_bench \
             --features "sync http1_1 tokio_base c_openssl_3_0" --release
         ;;
     *)
-        echo "YLONG_CLIENT must be async, sync, or both" >&2
+        echo "YLONG_CLIENT must be async, async-ylong, sync, or both" >&2
         exit 2
         ;;
 esac
@@ -157,6 +164,10 @@ run_ylong_once() {
             echo "== ylong_http_client_async run ${run}/${REPEAT} =="
             "${prefix[@]}" "$YLONG_ASYNC_BIN" "${ylong_args[@]}"
             ;;
+        async-ylong)
+            echo "== ylong_http_client_async_ylong run ${run}/${REPEAT} =="
+            "${prefix[@]}" "$YLONG_ASYNC_YLONG_BIN" "${ylong_args[@]}"
+            ;;
         sync)
             echo "== ylong_http_client_sync run ${run}/${REPEAT} =="
             "${prefix[@]}" "$YLONG_SYNC_BIN" "${common_args[@]}"
@@ -164,6 +175,8 @@ run_ylong_once() {
         both)
             echo "== ylong_http_client_async run ${run}/${REPEAT} =="
             "${prefix[@]}" "$YLONG_ASYNC_BIN" "${ylong_args[@]}"
+            echo "== ylong_http_client_async_ylong run ${run}/${REPEAT} =="
+            "${prefix[@]}" "$YLONG_ASYNC_YLONG_BIN" "${ylong_args[@]}"
             echo "== ylong_http_client_sync run ${run}/${REPEAT} =="
             "${prefix[@]}" "$YLONG_SYNC_BIN" "${common_args[@]}"
             ;;
@@ -186,11 +199,15 @@ case "$BENCH_ORDER" in
             async)
                 run_repeated "ylong_http_client_async" "$YLONG_ASYNC_BIN" "${ylong_args[@]}"
                 ;;
+            async-ylong)
+                run_repeated "ylong_http_client_async_ylong" "$YLONG_ASYNC_YLONG_BIN" "${ylong_args[@]}"
+                ;;
             sync)
                 run_repeated "ylong_http_client_sync" "$YLONG_SYNC_BIN" "${common_args[@]}"
                 ;;
             both)
                 run_repeated "ylong_http_client_async" "$YLONG_ASYNC_BIN" "${ylong_args[@]}"
+                run_repeated "ylong_http_client_async_ylong" "$YLONG_ASYNC_YLONG_BIN" "${ylong_args[@]}"
                 run_repeated "ylong_http_client_sync" "$YLONG_SYNC_BIN" "${common_args[@]}"
                 ;;
         esac
