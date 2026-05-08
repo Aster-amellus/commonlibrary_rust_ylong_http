@@ -135,6 +135,9 @@ pub mod tls_conn {
                 Scheme::HTTP => {
                     let tcp_stream = TcpStream::connect(addr.clone())
                         .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
+                    tcp_stream
+                        .set_nodelay(true)
+                        .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
                     if is_proxy && proxy_scheme == Some(Scheme::HTTPS) {
                         let proxy_config = proxy_tls_config.unwrap_or_default();
                         let proxy_host = proxy_host.unwrap_or_else(|| addr.clone());
@@ -153,6 +156,9 @@ pub mod tls_conn {
                 Scheme::HTTPS => {
                     let origin_pin_host = format!("{host}:{port}");
                     let tcp_stream = TcpStream::connect(addr.as_str())
+                        .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
+                    tcp_stream
+                        .set_nodelay(true)
                         .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
                     if is_proxy && proxy_scheme == Some(Scheme::HTTPS) {
                         let proxy_config = proxy_tls_config.unwrap_or_default();
