@@ -14,9 +14,20 @@ import threading
 import urllib.parse
 
 
+def set_tcp_nodelay(sock):
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+
+
 class OriginHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     response_size = 1024
+
+    def setup(self):
+        super().setup()
+        set_tcp_nodelay(self.connection)
 
     def do_GET(self):
         body = b"x" * self.response_size
@@ -25,6 +36,7 @@ class OriginHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -40,6 +52,7 @@ class OriginHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
 
     def log_message(self, fmt, *args):
         return
@@ -57,6 +70,7 @@ class ThreadingHTTPSServer(ThreadingHTTPServer):
 
     def get_request(self):
         sock, addr = self.socket.accept()
+        set_tcp_nodelay(sock)
         return self.context.wrap_socket(sock, server_side=True), addr
 
 
@@ -71,6 +85,7 @@ class HttpsProxyServer(socketserver.ThreadingTCPServer):
 
     def get_request(self):
         sock, addr = self.socket.accept()
+        set_tcp_nodelay(sock)
         return self.context.wrap_socket(sock, server_side=True), addr
 
 
@@ -134,6 +149,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
         host, port = split_host_port(target)
         try:
             upstream = socket.create_connection((host, port), timeout=10)
+            set_tcp_nodelay(upstream)
         except OSError:
             self.request.sendall(f"{version} 502 Bad Gateway\r\n\r\n".encode("ascii"))
             return

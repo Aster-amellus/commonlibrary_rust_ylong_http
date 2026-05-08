@@ -23,14 +23,19 @@ typedef struct {
     long insecure_proxy;
     long insecure_origin;
     size_t requests;
+    size_t warmup_requests;
     size_t concurrency;
+    size_t runtime_threads;
+    size_t read_buffer_size;
     size_t body_size;
 } Config;
 
 typedef struct {
     const Config *config;
+    pthread_barrier_t *barrier;
     size_t start;
     size_t count;
+    size_t warmup_count;
     uint64_t *latencies_us;
     char *body;
     struct curl_slist *headers;
@@ -81,6 +86,7 @@ static void set_common_options(CURL *curl, Worker *worker)
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &worker->bytes);
+    curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, (long)config->read_buffer_size);
 
     if (strcmp(config->method, "POST") == 0) {
         worker->headers = curl_slist_append(worker->headers, "Expect:");
@@ -120,14 +126,16 @@ static void *run_worker(void *arg)
     Worker *worker = (Worker *)arg;
     CURL *curl = curl_easy_init();
     if (curl == NULL) {
-        worker->errors += worker->count;
+        worker->errors += worker->warmup_count + worker->count;
+        pthread_barrier_wait(worker->barrier);
         return NULL;
     }
 
     if (strcmp(worker->config->method, "POST") == 0 && worker->config->body_size > 0) {
         worker->body = malloc(worker->config->body_size);
         if (worker->body == NULL) {
-            worker->errors += worker->count;
+            worker->errors += worker->warmup_count + worker->count;
+            pthread_barrier_wait(worker->barrier);
             curl_easy_cleanup(curl);
             return NULL;
         }
@@ -135,6 +143,15 @@ static void *run_worker(void *arg)
     }
 
     set_common_options(curl, worker);
+
+    for (size_t i = 0; i < worker->warmup_count; i++) {
+        CURLcode code = curl_easy_perform(curl);
+        if (code != CURLE_OK) {
+            worker->errors++;
+        }
+    }
+    worker->bytes = 0;
+    pthread_barrier_wait(worker->barrier);
 
     for (size_t i = 0; i < worker->count; i++) {
         uint64_t started = now_us();
@@ -170,7 +187,8 @@ static void usage(const char *program)
             "[--concurrency N] [--proxy-ca-file PEM] [--proxy-client-cert PEM] "
             "[--proxy-client-key PEM] [--origin-ca-file PEM] [--insecure-proxy] "
             "[--insecure-origin] [--proxy-user-pass user:pass] [--method GET|POST] "
-            "[--body-size N]\n",
+            "[--body-size N] [--warmup-requests N] [--runtime-threads N] "
+            "[--read-buffer-size N]\n",
             program);
 }
 
@@ -180,6 +198,8 @@ static Config parse_args(int argc, char **argv)
     memset(&config, 0, sizeof(config));
     config.requests = 1000;
     config.concurrency = 16;
+    config.runtime_threads = 0;
+    config.read_buffer_size = 64 * 1024;
     config.method = "GET";
 
     for (int i = 1; i < argc; i++) {
@@ -189,8 +209,17 @@ static Config parse_args(int argc, char **argv)
             config.proxy = next_value(&i, argc, argv, "--proxy");
         } else if (strcmp(argv[i], "--requests") == 0) {
             config.requests = strtoull(next_value(&i, argc, argv, "--requests"), NULL, 10);
+        } else if (strcmp(argv[i], "--warmup-requests") == 0) {
+            config.warmup_requests =
+                strtoull(next_value(&i, argc, argv, "--warmup-requests"), NULL, 10);
         } else if (strcmp(argv[i], "--concurrency") == 0) {
             config.concurrency = strtoull(next_value(&i, argc, argv, "--concurrency"), NULL, 10);
+        } else if (strcmp(argv[i], "--runtime-threads") == 0) {
+            config.runtime_threads =
+                strtoull(next_value(&i, argc, argv, "--runtime-threads"), NULL, 10);
+        } else if (strcmp(argv[i], "--read-buffer-size") == 0) {
+            config.read_buffer_size =
+                strtoull(next_value(&i, argc, argv, "--read-buffer-size"), NULL, 10);
         } else if (strcmp(argv[i], "--method") == 0) {
             config.method = next_value(&i, argc, argv, "--method");
         } else if (strcmp(argv[i], "--body-size") == 0) {
@@ -220,9 +249,12 @@ static Config parse_args(int argc, char **argv)
     }
 
     if (config.url == NULL || config.proxy == NULL || config.requests == 0 ||
-        config.concurrency == 0) {
+        config.concurrency == 0 || config.read_buffer_size == 0) {
         usage(argv[0]);
         exit(2);
+    }
+    if (config.runtime_threads == 0) {
+        config.runtime_threads = config.concurrency;
     }
     if (strcmp(config.method, "GET") != 0 && strcmp(config.method, "POST") != 0) {
         fprintf(stderr, "--method must be GET or POST\n");
@@ -241,14 +273,18 @@ int main(int argc, char **argv)
     pthread_t *threads = calloc(config.concurrency, sizeof(pthread_t));
     Worker *workers = calloc(config.concurrency, sizeof(Worker));
     uint64_t *latencies = calloc(config.requests, sizeof(uint64_t));
+    pthread_barrier_t barrier;
     if (threads == NULL || workers == NULL || latencies == NULL) {
         fprintf(stderr, "allocation failed\n");
+        return 2;
+    }
+    if (pthread_barrier_init(&barrier, NULL, (unsigned int)config.concurrency + 1) != 0) {
+        fprintf(stderr, "barrier init failed\n");
         return 2;
     }
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    uint64_t started = now_us();
     size_t cursor = 0;
     for (size_t i = 0; i < config.concurrency; i++) {
         size_t count = config.requests / config.concurrency;
@@ -256,12 +292,19 @@ int main(int argc, char **argv)
             count++;
         }
         workers[i].config = &config;
+        workers[i].barrier = &barrier;
         workers[i].start = cursor;
         workers[i].count = count;
+        workers[i].warmup_count = config.warmup_requests / config.concurrency;
+        if (i < config.warmup_requests % config.concurrency) {
+            workers[i].warmup_count++;
+        }
         workers[i].latencies_us = latencies;
         cursor += count;
         pthread_create(&threads[i], NULL, run_worker, &workers[i]);
     }
+    pthread_barrier_wait(&barrier);
+    uint64_t started = now_us();
 
     size_t errors = 0;
     uint64_t bytes = 0;
@@ -271,14 +314,13 @@ int main(int argc, char **argv)
         bytes += workers[i].bytes;
     }
     uint64_t elapsed_us = now_us() - started;
-    size_t completed = config.requests - errors;
-
     size_t compact = 0;
     for (size_t i = 0; i < config.concurrency; i++) {
         memmove(&latencies[compact], &latencies[workers[i].start],
                 workers[i].completed * sizeof(uint64_t));
         compact += workers[i].completed;
     }
+    size_t completed = compact;
 
     if (completed > 0) {
         qsort(latencies, completed, sizeof(uint64_t), cmp_u64);
@@ -288,18 +330,21 @@ int main(int argc, char **argv)
     double rps = elapsed_us == 0 ? 0.0 : (double)completed * 1000000.0 / (double)elapsed_us;
 
     printf("{\"client\":\"libcurl\",\"url\":\"%s\",\"proxy\":\"%s\",\"method\":\"%s\","
-           "\"body_size\":%zu,\"requests\":%zu,\"completed\":%zu,\"errors\":%zu,"
-           "\"concurrency\":%zu,\"bytes\":%llu,"
+           "\"body_size\":%zu,\"requests\":%zu,\"warmup_requests\":%zu,"
+           "\"completed\":%zu,\"errors\":%zu,"
+           "\"concurrency\":%zu,\"runtime_threads\":%zu,\"read_buffer_size\":%zu,\"bytes\":%llu,"
            "\"elapsed_ms\":%.3f,\"rps\":%.3f,\"latency_us_p50\":%llu,"
            "\"latency_us_p90\":%llu,\"latency_us_p95\":%llu,\"latency_us_p99\":%llu}\n",
            config.url, config.proxy, config.method, config.body_size, config.requests,
-           completed, errors, config.concurrency, (unsigned long long)bytes, elapsed_ms, rps,
+           config.warmup_requests, completed, errors, config.concurrency,
+           config.runtime_threads, config.read_buffer_size, (unsigned long long)bytes, elapsed_ms, rps,
            (unsigned long long)percentile(latencies, completed, 50),
            (unsigned long long)percentile(latencies, completed, 90),
            (unsigned long long)percentile(latencies, completed, 95),
            (unsigned long long)percentile(latencies, completed, 99));
 
     curl_global_cleanup();
+    pthread_barrier_destroy(&barrier);
     free(latencies);
     free(workers);
     free(threads);
