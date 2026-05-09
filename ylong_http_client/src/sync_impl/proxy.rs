@@ -20,6 +20,7 @@ use crate::{ErrorKind, HttpClientError, TlsConfig};
 
 pub(crate) const DEFAULT_READ_AHEAD_BUFFER: usize = 256 * 1024;
 pub(crate) const CONNECT_PROXY_READ_AHEAD_BUFFER: usize = 64 * 1024;
+pub(crate) const ORIGIN_TLS_READ_AHEAD_BUFFER: usize = 8 * 1024;
 
 pub(crate) fn connect_tls<S>(
     config: &TlsConfig,
