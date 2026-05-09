@@ -662,3 +662,53 @@ cargo test -p ylong_http_client --test sdv_sync_https_proxy \
 ```
 
 结果：async/sync HTTPS proxy SDV 各 11 passed。严格 CONNECT 性能仍未达标。
+
+## Native CONNECT off-CPU profiling 尝试
+
+结论：当前系统允许普通 `perf stat`，但不允许当前用户读取 scheduler tracepoint id，因此 `perf sched record` 不能直接运行。可用的降级证据继续指向调度/尾延迟：ylong 的 CPU 指标不差，但 p99 仍显著高于 libcurl。
+
+阻塞点：
+
+```text
+perf sched record -o target/https_proxy_bench/profiles/perf-sched-smoke.data -- sleep 0.1
+
+event syntax error: 'sched:sched_switch'
+can't access trace events
+No permissions to read /sys/kernel/tracing//events/sched/sched_switch
+```
+
+当前权限状态：
+
+```text
+/proc/sys/kernel/perf_event_paranoid = -1
+/proc/sys/kernel/kptr_restrict = 0
+/proc/sys/kernel/nmi_watchdog = 0
+/sys/kernel/tracing/events/sched/sched_switch/id = -r--r----- root root
+```
+
+这说明还需要让当前用户可读 tracefs 的 sched tracepoint，例如由管理员执行：
+
+```bash
+sudo mount -o remount,mode=755 /sys/kernel/tracing
+sudo chmod -R a+rX /sys/kernel/tracing/events/sched
+```
+
+在 tracefs 未放开前，本轮用 `/usr/bin/time -v` 和 `perf stat` 降级观测 `requests=10000` strict CONNECT：
+
+| Client | rps | p99 | user | sys | voluntary cs | involuntary cs | max RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ylong async-ylong | 3607.187 | 46.489ms | 10.63s | 2.93s | 1830 | 5984 | 40644 KB |
+| libcurl | 3699.668 | 26.418ms | 10.81s | 3.83s | 14700 | 1913 | 36588 KB |
+
+同一 workload 的 `perf stat` probe：
+
+| Client | rps | p99 | task-clock | cycles | instructions | cache-misses | context switches | cpu migrations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ylong async-ylong | 3730.365 | 44.118ms | 13.496s | 57.748B | 68.648B | 408.983M | 7897 | 675 |
+| libcurl | 3509.012 | 27.123ms | 14.576s | 62.135B | 71.771B | 488.180M | 15589 | 1204 |
+
+归因更新：
+
+- `perf stat` 下 ylong 的吞吐可高于 libcurl，但 p99 仍明显更差，说明 O4b 的剩余问题不是平均 CPU 开销。
+- `/usr/bin/time -v` 显示 ylong 自愿上下文切换少、非自愿上下文切换多；这更像 worker 被抢占或 wake/progress 分布不均，而不是连接池 acquire/release。
+- 下一步必须拿到 `sched_switch`/`sched_wakeup` 级证据，或者在 ylong runtime/benchmark 内部补等价的 Pending-to-Ready gap histogram；否则继续改 TLS buffer、ready-drain 或通用 `SSL_pending` drain 会继续低效。
