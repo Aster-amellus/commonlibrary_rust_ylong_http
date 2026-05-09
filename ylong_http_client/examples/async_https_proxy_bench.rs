@@ -13,6 +13,7 @@
 
 /// HTTPS proxy benchmark client for comparison with libcurl.
 use std::env;
+use std::future::{poll_fn, Future};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -69,12 +70,18 @@ struct WorkerResult {
 #[derive(Default)]
 struct TraceSamples {
     request_ready_us: Vec<u128>,
+    request_poll_count: Vec<u128>,
+    request_pending_count: Vec<u128>,
+    request_pending_gap_us: Vec<u128>,
     connect_us: Vec<u128>,
     request_write_us: Vec<u128>,
     response_wait_us: Vec<u128>,
     transfer_us: Vec<u128>,
     body_first_byte_us: Vec<u128>,
     body_drain_us: Vec<u128>,
+    body_poll_count: Vec<u128>,
+    body_pending_count: Vec<u128>,
+    body_pending_gap_us: Vec<u128>,
     body_read_wait_us: Vec<u128>,
     body_eof_wait_us: Vec<u128>,
     body_reads_per_request: Vec<u128>,
@@ -84,6 +91,12 @@ struct TraceSamples {
 impl TraceSamples {
     fn merge(&mut self, mut other: TraceSamples) {
         self.request_ready_us.append(&mut other.request_ready_us);
+        self.request_poll_count
+            .append(&mut other.request_poll_count);
+        self.request_pending_count
+            .append(&mut other.request_pending_count);
+        self.request_pending_gap_us
+            .append(&mut other.request_pending_gap_us);
         self.connect_us.append(&mut other.connect_us);
         self.request_write_us.append(&mut other.request_write_us);
         self.response_wait_us.append(&mut other.response_wait_us);
@@ -91,6 +104,11 @@ impl TraceSamples {
         self.body_first_byte_us
             .append(&mut other.body_first_byte_us);
         self.body_drain_us.append(&mut other.body_drain_us);
+        self.body_poll_count.append(&mut other.body_poll_count);
+        self.body_pending_count
+            .append(&mut other.body_pending_count);
+        self.body_pending_gap_us
+            .append(&mut other.body_pending_gap_us);
         self.body_read_wait_us.append(&mut other.body_read_wait_us);
         self.body_eof_wait_us.append(&mut other.body_eof_wait_us);
         self.body_reads_per_request
@@ -100,6 +118,12 @@ impl TraceSamples {
 
     fn push(&mut self, trace: ResponseTrace) {
         self.request_ready_us.push(trace.request_ready_us);
+        self.request_poll_count
+            .push(trace.request_poll_trace.polls as u128);
+        self.request_pending_count
+            .push(trace.request_poll_trace.pending as u128);
+        self.request_pending_gap_us
+            .extend(trace.request_poll_trace.pending_gap_us);
         if let Some(connect_us) = trace.connect_us {
             self.connect_us.push(connect_us);
         }
@@ -116,6 +140,12 @@ impl TraceSamples {
             self.body_first_byte_us.push(body_first_byte_us);
         }
         self.body_drain_us.push(trace.body_drain_us);
+        self.body_poll_count
+            .push(trace.body_poll_trace.polls as u128);
+        self.body_pending_count
+            .push(trace.body_poll_trace.pending as u128);
+        self.body_pending_gap_us
+            .extend(trace.body_poll_trace.pending_gap_us);
         self.body_read_wait_us.extend(trace.body_read_wait_us);
         if let Some(body_eof_wait_us) = trace.body_eof_wait_us {
             self.body_eof_wait_us.push(body_eof_wait_us);
@@ -126,12 +156,18 @@ impl TraceSamples {
 
     fn sort(&mut self) {
         self.request_ready_us.sort_unstable();
+        self.request_poll_count.sort_unstable();
+        self.request_pending_count.sort_unstable();
+        self.request_pending_gap_us.sort_unstable();
         self.connect_us.sort_unstable();
         self.request_write_us.sort_unstable();
         self.response_wait_us.sort_unstable();
         self.transfer_us.sort_unstable();
         self.body_first_byte_us.sort_unstable();
         self.body_drain_us.sort_unstable();
+        self.body_poll_count.sort_unstable();
+        self.body_pending_count.sort_unstable();
+        self.body_pending_gap_us.sort_unstable();
         self.body_read_wait_us.sort_unstable();
         self.body_eof_wait_us.sort_unstable();
         self.body_reads_per_request.sort_unstable();
@@ -141,16 +177,33 @@ impl TraceSamples {
 
 struct ResponseTrace {
     request_ready_us: u128,
+    request_poll_trace: FuturePollTrace,
     connect_us: Option<u128>,
     request_write_us: Option<u128>,
     response_wait_us: Option<u128>,
     transfer_us: Option<u128>,
     body_first_byte_us: Option<u128>,
     body_drain_us: u128,
+    body_poll_trace: FuturePollTrace,
     body_read_wait_us: Vec<u128>,
     body_eof_wait_us: Option<u128>,
     bytes: u64,
     body_reads: u64,
+}
+
+#[derive(Default)]
+struct FuturePollTrace {
+    polls: u64,
+    pending: u64,
+    pending_gap_us: Vec<u128>,
+}
+
+impl FuturePollTrace {
+    fn merge(&mut self, mut other: FuturePollTrace) {
+        self.polls += other.polls;
+        self.pending += other.pending;
+        self.pending_gap_us.append(&mut other.pending_gap_us);
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -558,7 +611,9 @@ async fn send_request(
     trace_summary: bool,
 ) -> Result<ResponseStats, HttpClientError> {
     let request_started = Instant::now();
-    let mut response = client.request(request).await?;
+    let (response, request_poll_trace) =
+        measure_future(client.request(request), trace_summary).await;
+    let mut response = response?;
     let request_ready_us = request_started.elapsed().as_micros();
     if !response.status().is_successful() {
         return Err(HttpClientError::other(std::io::Error::new(
@@ -601,21 +656,26 @@ async fn send_request(
         .flatten();
     let body_started = Instant::now();
     let mut body_first_byte_us = None;
+    let mut body_poll_trace = FuturePollTrace::default();
     let mut body_read_wait_us = Vec::new();
     let mut body_eof_wait_us = None;
     let mut bytes = 0;
     let mut body_reads = 0;
     loop {
         let read_started = Instant::now();
-        let size = response.data(read_buffer).await?;
+        let (size, read_poll_trace) =
+            measure_future(response.data(read_buffer), trace_summary).await;
+        let size = size?;
         let read_wait_us = read_started.elapsed().as_micros();
         if size == 0 {
             if trace_summary {
                 body_eof_wait_us = Some(read_wait_us);
+                body_poll_trace.merge(read_poll_trace);
             }
             break;
         }
         if trace_summary {
+            body_poll_trace.merge(read_poll_trace);
             body_read_wait_us.push(read_wait_us);
             if body_first_byte_us.is_none() {
                 body_first_byte_us = Some(body_started.elapsed().as_micros());
@@ -626,12 +686,14 @@ async fn send_request(
     }
     let trace = trace_summary.then(|| ResponseTrace {
         request_ready_us,
+        request_poll_trace,
         connect_us,
         request_write_us,
         response_wait_us,
         transfer_us,
         body_first_byte_us,
         body_drain_us: body_started.elapsed().as_micros(),
+        body_poll_trace,
         body_read_wait_us,
         body_eof_wait_us,
         bytes,
@@ -642,6 +704,36 @@ async fn send_request(
         body_reads,
         trace,
     })
+}
+
+async fn measure_future<F>(future: F, enabled: bool) -> (F::Output, FuturePollTrace)
+where
+    F: Future,
+{
+    if !enabled {
+        return (future.await, FuturePollTrace::default());
+    }
+
+    let mut future = Box::pin(future);
+    let mut trace = FuturePollTrace::default();
+    let mut last_pending: Option<Instant> = None;
+    let output = poll_fn(|cx| {
+        trace.polls += 1;
+        if let Some(instant) = last_pending.take() {
+            trace.pending_gap_us.push(instant.elapsed().as_micros());
+        }
+        match future.as_mut().poll(cx) {
+            std::task::Poll::Ready(value) => std::task::Poll::Ready(value),
+            std::task::Poll::Pending => {
+                trace.pending += 1;
+                last_pending = Some(Instant::now());
+                std::task::Poll::Pending
+            }
+        }
+    })
+    .await;
+
+    (output, trace)
 }
 
 async fn join_worker(handle: JoinHandle<WorkerResult>) -> WorkerResult {
@@ -701,7 +793,7 @@ fn print_trace_summary(
 ) {
     trace.sort();
     println!(
-        "{{\"kind\":\"request_trace_summary\",\"client\":\"ylong_http_client\",\"url\":\"{}\",\"proxy\":\"{}\",\"completed\":{},\"errors\":{},\"concurrency\":{},\"runtime_threads\":{},\"request_ready_p50_us\":{},\"request_ready_p90_us\":{},\"request_ready_p99_us\":{},\"connect_samples\":{},\"connect_p99_us\":{},\"request_write_samples\":{},\"request_write_p99_us\":{},\"response_wait_samples\":{},\"response_wait_p99_us\":{},\"transfer_samples\":{},\"transfer_p99_us\":{},\"body_first_byte_p99_us\":{},\"body_drain_p50_us\":{},\"body_drain_p90_us\":{},\"body_drain_p99_us\":{},\"body_read_wait_samples\":{},\"body_read_wait_avg_us\":{:.3},\"body_read_wait_p90_us\":{},\"body_read_wait_p99_us\":{},\"body_read_wait_max_us\":{},\"body_eof_wait_p99_us\":{},\"body_reads_per_request_p50\":{},\"body_reads_per_request_p99\":{},\"bytes_per_request_p50\":{},\"worker_elapsed_us_min\":{},\"worker_elapsed_us_max\":{}}}",
+        "{{\"kind\":\"request_trace_summary\",\"client\":\"ylong_http_client\",\"url\":\"{}\",\"proxy\":\"{}\",\"completed\":{},\"errors\":{},\"concurrency\":{},\"runtime_threads\":{},\"request_ready_p50_us\":{},\"request_ready_p90_us\":{},\"request_ready_p99_us\":{},\"request_poll_count_p99\":{},\"request_pending_count_p99\":{},\"request_pending_gap_p99_us\":{},\"request_pending_gap_max_us\":{},\"connect_samples\":{},\"connect_p99_us\":{},\"request_write_samples\":{},\"request_write_p99_us\":{},\"response_wait_samples\":{},\"response_wait_p99_us\":{},\"transfer_samples\":{},\"transfer_p99_us\":{},\"body_first_byte_p99_us\":{},\"body_drain_p50_us\":{},\"body_drain_p90_us\":{},\"body_drain_p99_us\":{},\"body_poll_count_p99\":{},\"body_pending_count_p99\":{},\"body_pending_gap_p99_us\":{},\"body_pending_gap_max_us\":{},\"body_read_wait_samples\":{},\"body_read_wait_avg_us\":{:.3},\"body_read_wait_p90_us\":{},\"body_read_wait_p99_us\":{},\"body_read_wait_max_us\":{},\"body_eof_wait_p99_us\":{},\"body_reads_per_request_p50\":{},\"body_reads_per_request_p99\":{},\"bytes_per_request_p50\":{},\"worker_elapsed_us_min\":{},\"worker_elapsed_us_max\":{}}}",
         escape_json(&config.url),
         escape_json(&config.proxy),
         completed,
@@ -711,6 +803,10 @@ fn print_trace_summary(
         percentile(&trace.request_ready_us, 50),
         percentile(&trace.request_ready_us, 90),
         percentile(&trace.request_ready_us, 99),
+        percentile(&trace.request_poll_count, 99),
+        percentile(&trace.request_pending_count, 99),
+        percentile(&trace.request_pending_gap_us, 99),
+        max_u128(&trace.request_pending_gap_us),
         trace.connect_us.len(),
         percentile(&trace.connect_us, 99),
         trace.request_write_us.len(),
@@ -723,6 +819,10 @@ fn print_trace_summary(
         percentile(&trace.body_drain_us, 50),
         percentile(&trace.body_drain_us, 90),
         percentile(&trace.body_drain_us, 99),
+        percentile(&trace.body_poll_count, 99),
+        percentile(&trace.body_pending_count, 99),
+        percentile(&trace.body_pending_gap_us, 99),
+        max_u128(&trace.body_pending_gap_us),
         trace.body_read_wait_us.len(),
         average_u128(&trace.body_read_wait_us),
         percentile(&trace.body_read_wait_us, 90),
