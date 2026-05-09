@@ -429,7 +429,7 @@ TLS/BIO trace 对照：
 - ylong runtime 入口下 `SSL_read` 次数不高于 libcurl，当前差距不能简单归因为 ylong 调用更多 OpenSSL read。
 - `BIO_read` 次数仍略高，但差异小于前序 tokio 入口；需要继续结合 off-CPU 和 per-connection progress 观察等待时间，而不是只看 CPU top self。
 - `perf stat` 的 1000-request probe 显示 ylong runtime cycles、instructions、context switches、cache misses 均低于 libcurl 或接近，但 wall time 只小幅领先，说明严格 CONNECT 剩余问题更像尾延迟/调度进度分布问题。
-- 本阶段没有保留 `SSL_pending` ready-drain 或内层 origin TLS read-ahead 试验：两者均未降低 16 KiB body read 粒度，也没有稳定提升吞吐。
+- 本阶段没有保留 `SSL_pending` ready-drain；内层 origin TLS read-ahead 后续收窄到 `HttpsOverProxy` 路径单独复测，结果见后文 P16。
 
 ## Native CONNECT worker elapsed instrumentation
 
@@ -585,3 +585,80 @@ cargo test -p ylong_http_client --test sdv_async_http_body_io --features "async 
 - 正式吞吐验收不启用 `--trace-summary`，避免 ylong-only instrumentation 污染对比。
 - trace 模式继续用于定位，但重点转向 off-CPU scheduler latency、Pending/wake 间隔、任务迁移和双层 TLS readiness 传播。
 - 在没有上述证据前，不再继续盲目增大 body ready-drain 预算或 TLS read buffer。
+
+## Native CONNECT origin TLS read-ahead 与负实验
+
+结论：CONNECT 内层 origin TLS 现在单独启用 8 KiB read-ahead，范围仅限 `HttpsOverProxy` 的 inner origin TLS，不影响直连 HTTPS、HTTP target over HTTPS proxy 或 CONNECT 外层 proxy TLS 策略。该改动能减少双层 TLS body drain 中的读取推进次数，但 strict CONNECT 吞吐仍未达到 20%+ 目标。
+
+变更 commit：
+
+```text
+c565843 perf(proxy): enable CONNECT origin TLS read-ahead
+```
+
+策略冻结：
+
+- `HTTP target over HTTPS proxy`：外层 proxy TLS read-ahead 保持开启，OpenSSL read buffer 为 256 KiB。
+- `HTTPS target over HTTPS proxy / CONNECT`：外层 proxy TLS read-ahead 保持开启，OpenSSL read buffer 为 64 KiB。
+- `HTTPS target over HTTPS proxy / CONNECT`：内层 origin TLS 使用 8 KiB read-ahead。
+- 非 CONNECT origin TLS 路径保持原来的无 read-ahead 行为，避免扩大优化范围。
+
+严格 CONNECT no-trace 5-run：
+
+```text
+url=https://127.0.0.1:38081/
+proxy=https://localhost:38444
+requests=300
+warmup=64
+concurrency=64
+runtime_threads=16
+read_buffer_size=262144
+client=async-ylong
+trace_summary=false
+```
+
+| Run | ylong async-ylong rps | libcurl rps | 提升 | ylong body reads | libcurl body reads | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 3734.354 | 3406.613 | +9.6% | 2646 | 19200 | fail |
+| 2 | 3561.242 | 3799.825 | -6.3% | 2637 | 19200 | fail |
+| 3 | 3801.274 | 3803.438 | -0.1% | 2658 | 19200 | fail |
+| 4 | 3747.396 | 3799.970 | -1.4% | 2665 | 19200 | fail |
+| 5 | 3703.583 | 3821.121 | -3.1% | 2634 | 19200 | fail |
+
+平均：
+
+| Client | 平均 rps | 平均 body reads |
+| --- | ---: | ---: |
+| ylong_http_client async-ylong | 3709.570 | 2648.0 |
+| libcurl | 3726.193 | 19200.0 |
+
+平均提升约 -0.4%，strict CONNECT 仍为 0/5 达到 20%+。
+
+本轮不保留的负实验：
+
+- `SSL_pending` poll 内 drain：短测显示吞吐和 p99 退化，说明直接在通用 `AsyncSslStream::poll_read` 中循环消费 OpenSSL pending 数据会拉长单次 poll 或破坏双层 TLS 的推进节奏；不保留。
+- `BODY_READY_DRAIN_READS=16`：body reads 降到约 1.3k，但 5-run 平均约 -1.9%，p99 明显高于 libcurl；不保留。
+- `--client-per-worker` sticky client：吞吐低于共享 client/pool 模式，不支持“连接池 acquire/release 是主因”的假设。
+
+本轮验证：
+
+```bash
+rustfmt --check ylong_http_client/src/async_impl/proxy.rs \
+  ylong_http_client/src/sync_impl/proxy.rs \
+  ylong_http_client/src/async_impl/connector/mod.rs \
+  ylong_http_client/src/sync_impl/connector.rs
+
+cargo check -p ylong_http_client --example async_ylong_https_proxy_bench \
+  --features "async http1_1 ylong_base c_openssl_3_0"
+
+cargo check -p ylong_http_client --example sync_https_proxy_bench \
+  --features "sync http1_1 tokio_base c_openssl_3_0"
+
+cargo test -p ylong_http_client --test sdv_async_https_proxy \
+  --features "async http1_1 ylong_base c_openssl_3_0"
+
+cargo test -p ylong_http_client --test sdv_sync_https_proxy \
+  --features "sync http1_1 tokio_base c_openssl_3_0"
+```
+
+结果：async/sync HTTPS proxy SDV 各 11 passed。严格 CONNECT 性能仍未达标。

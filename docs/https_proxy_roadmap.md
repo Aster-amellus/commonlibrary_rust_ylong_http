@@ -10,7 +10,7 @@
 | O2：代理功能模块化 | CONNECT tunnel 从 connector 内抽出；async/sync proxy transport 独立模块；代理元数据统一沉淀到 `util::proxy`；连接池 key 纳入 proxy identity；文档记录新增协议扩展入口 | 已完成 v1 + pool key hardening |
 | O3：规范、测试、可用性文档 | 对齐 RFC 9110、RFC 9112、RFC 8446、OpenSSL、libcurl；记录开源 TLS/proxy 测试套件定位；提供 API 文档、使用指南、架构图、测试命令 | 已完成矩阵更新 |
 | O4a：HTTP target over HTTPS proxy 性能验收 | 复用 ylong/libcurl HTTPS proxy benchmark harness；HTTP target 场景 5 次中至少 4 次达到 20%+；记录环境、命令和结果 | 已完成；5/5 达标 |
-| O4b：HTTPS target over HTTPS proxy / CONNECT 高压性能验收 | 聚焦 outer proxy TLS + CONNECT + inner origin TLS + 1 MiB body drain；CONNECT 严格场景 5 次中至少 4 次达到 20%+；补齐 per-request/per-connection profiling | 未完成；当前重点是 tail latency、pool dispatch、双层 TLS progress |
+| O4b：HTTPS target over HTTPS proxy / CONNECT 高压性能验收 | 聚焦 outer proxy TLS + CONNECT + inner origin TLS + 1 MiB body drain；CONNECT 严格场景 5 次中至少 4 次达到 20%+；补齐 per-request/per-connection profiling | 未完成；当前重点是 response first-byte tail、off-CPU 调度、双层 TLS readiness |
 
 ## 阶段架构图
 
@@ -237,6 +237,24 @@ flowchart TB
     Status --> Next[Next evidence<br/>off-CPU scheduling and nested TLS readiness]
 ```
 
+### P16 CONNECT 内层 origin TLS read-ahead 与负实验后
+
+```mermaid
+flowchart TB
+    Strict[Native CONNECT strict workload<br/>300 requests x 64 concurrency] --> Outer[Outer proxy TLS<br/>read-ahead on + 64 KiB buffer]
+    Strict --> Inner[Inner origin TLS<br/>8 KiB read-ahead only for HttpsOverProxy]
+    Strict --> Negative[Rejected experiments]
+    Negative --> PendingDrain[SSL_pending poll drain<br/>worse throughput/p99]
+    Negative --> Drain16[HttpBody ready-drain 16<br/>fewer reads but worse p99]
+    Negative --> Sticky[client-per-worker<br/>lower throughput]
+    Inner --> Bench[no-trace strict 5-run]
+    Outer --> Bench
+    Bench --> Result[avg ylong 3709.6 rps<br/>avg libcurl 3726.2 rps<br/>avg -0.4%]
+    Result --> Gate[0 of 5 pass 20% target]
+    Gate --> Status[O4b still incomplete]
+    Status --> Next[Next evidence<br/>off-CPU sched trace and nested TLS readiness counters]
+```
+
 ## M1 TLS 配置补齐
 
 状态：已完成。
@@ -409,9 +427,11 @@ CONNECT 高压当前结论：
 - HTTP/1 request 写完后已显式 flush 再进入 response read，作为双层 TLS 场景的正确性保护；该改动没有让 strict CONNECT 达到 20% 目标。
 - ready-drain 与热连接复用实验已落地：`HttpBody` 在单次 poll 中最多连续消费 8 次 ready read，HTTP/1 idle dispatcher 改为反向扫描以偏向最近热连接。
 - ready-drain 使 ylong 在 300 个 1 MiB CONNECT 响应中的 body read 次数从约 19.2k 降到约 2.6k；预算 16 会拉长单次 read wait 并退化，因此不保留。
-- 最新 strict CONNECT no-trace 5-run：ylong async-ylong 平均约 3776.9 rps，libcurl 平均约 3664.1 rps，平均约 +3.1%；5 次提升分别约 +1.9%、+3.7%、+6.2%、+4.5%、-0.4%，仍为 0/5 达到 20%+。
+- CONNECT 内层 origin TLS 现在仅在 `HttpsOverProxy` 路径启用 8 KiB read-ahead；直连 HTTPS、HTTP target over HTTPS proxy、CONNECT 外层 proxy TLS 策略不受影响。
+- `SSL_pending` poll 内 drain、`BODY_READY_DRAIN_READS=16` 和 `--client-per-worker` 都已做负实验，结果不支持保留。
+- 最新 strict CONNECT no-trace 5-run：ylong async-ylong 平均约 3709.6 rps，libcurl 平均约 3726.2 rps，平均约 -0.4%；5 次提升分别约 +9.6%、-6.3%、-0.1%、-1.4%、-3.1%，仍为 0/5 达到 20%+。
 - O4a HTTP target smoke 仍正常：20 request、4 concurrency 下 ylong 约 4753 rps，libcurl 约 1787 rps，说明本阶段没有破坏已完成路径。
-- 因此下一阶段重点从继续减少 body read 次数，转为 off-CPU scheduler latency、per-request connection progress 分布、CONNECT 双 TLS 读写交互和尾延迟归因。
+- 因此下一阶段重点从继续减少 body read 次数，转为 off-CPU scheduler latency、response first-byte wait、CONNECT 双 TLS readiness 传播和尾延迟归因。
 - O4a `HTTP target over HTTPS proxy` 已完成并冻结；后续优化不得扩大到该路径，除非用于回归验证。
 - O4b `HTTPS target over HTTPS proxy / CONNECT` 仍未完成；只有严格 CONNECT 场景 5 次中至少 4 次达到 20%+ 后，才能将全部 OKR 标记为 100% 完成。
 
@@ -420,7 +440,7 @@ CONNECT 高压当前结论：
 1. 冻结 HTTP target 256 KiB 与 CONNECT 64 KiB read-ahead 策略。
 2. 保留 request/body/pool 阶段 histogram，但正式吞吐验收不启用 `--trace-summary`。
 3. 用 off-CPU sched trace 或等价 runtime 事件确认 p99 差距是否来自 Pending/wake 间隔、任务迁移或双层 TLS readiness 传播。
-4. 若 off-CPU 证据指向 nested TLS readiness，再做 CONNECT-only progress loop；若证据指向调度，再收敛 runtime wake/worker 绑定策略。
+4. 若 off-CPU 证据指向 nested TLS readiness，再做 CONNECT-only progress loop；若证据指向调度，再收敛 runtime wake/worker 绑定策略；不要再扩大 ready-drain 预算或引入通用 `SSL_pending` drain。
 5. 每次优化后复跑 strict CONNECT 5 次，并保留 HTTP target smoke 作为已完成路径的回归保护。
 
 ## 风险与后续
