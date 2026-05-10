@@ -712,3 +712,54 @@ sudo chmod -R a+rX /sys/kernel/tracing/events/sched
 - `perf stat` 下 ylong 的吞吐可高于 libcurl，但 p99 仍明显更差，说明 O4b 的剩余问题不是平均 CPU 开销。
 - `/usr/bin/time -v` 显示 ylong 自愿上下文切换少、非自愿上下文切换多；这更像 worker 被抢占或 wake/progress 分布不均，而不是连接池 acquire/release。
 - 下一步必须拿到 `sched_switch`/`sched_wakeup` 级证据，或者在 ylong runtime/benchmark 内部补等价的 Pending-to-Ready gap histogram；否则继续改 TLS buffer、ready-drain 或通用 `SSL_pending` drain 会继续低效。
+
+## Native CONNECT future Pending gap trace
+
+结论：在 `--trace-summary` 中加入 Future poll wrapper 后，strict CONNECT 的 p99 进一步定位到单次 request future Pending 后的长 gap。request future 的 p99 Pending 次数只有 1 次，但 Pending 到下一次 poll 的 p99 gap 约 36ms，基本等于 `response_wait_p99`；body data future 也存在较长 Pending gap，但它是次要问题。
+
+变更 commit：
+
+```text
+a238a18 bench(proxy): trace CONNECT future pending gaps
+```
+
+trace probe：
+
+```bash
+REPEAT=1 YLONG_CLIENT=async-ylong tools/https_proxy_bench/run_https_proxy_bench.sh \
+  --url https://127.0.0.1:38081/ \
+  --proxy https://localhost:38444 \
+  --proxy-ca-file target/https_proxy_bench/certs/ca.pem \
+  --origin-ca-file target/https_proxy_bench/certs/ca.pem \
+  --requests 300 \
+  --warmup-requests 64 \
+  --concurrency 64 \
+  --runtime-threads 16 \
+  --read-buffer-size 262144 \
+  --trace-summary
+```
+
+核心输出：
+
+| Metric | Value |
+| --- | ---: |
+| ylong rps | 3744.020 |
+| ylong p99 | 42.907ms |
+| libcurl rps | 3776.530 |
+| libcurl p99 | 23.272ms |
+| request_ready_p99_us | 36264 |
+| response_wait_p99_us | 36195 |
+| request_poll_count_p99 | 2 |
+| request_pending_count_p99 | 1 |
+| request_pending_gap_p99_us | 36127 |
+| request_pending_gap_max_us | 44362 |
+| body_pending_count_p99 | 14 |
+| body_pending_gap_p99_us | 14567 |
+| body_pending_gap_max_us | 35574 |
+
+归因更新：
+
+- request future 在写完请求后通常只 Pending 一次；长尾来自这次 Pending 到下一次 poll 的等待，而不是频繁 poll churn。
+- `connect_p99_us` 仍只有 5us，继续排除连接池 acquire 作为主因。
+- `request_write_p99_us` 为 11311us，但 `response_wait_p99_us` 与 `request_pending_gap_p99_us` 基本重合；下一步应沿 request future Pending 的 wake 来源继续查，而不是扩大 body drain/read-ahead。
+- 在 tracefs 未开放前，库内或 benchmark 内的下一步证据应记录 wake 来源、连接 id、worker id、thread id，以及 Pending 返回时底层 TLS/BIO 的 WANT_READ/WANT_WRITE 状态。

@@ -269,6 +269,21 @@ flowchart TB
     OffCpu --> Status[O4b still incomplete]
 ```
 
+### P18 Future Pending gap trace 后
+
+```mermaid
+flowchart TB
+    Strict[Native CONNECT strict workload<br/>300 requests x 64 concurrency] --> Wrapper[trace-summary Future poll wrapper]
+    Wrapper --> RequestFuture[client.request future]
+    Wrapper --> BodyFuture[response.data future]
+    RequestFuture --> ReqGap[p99 pending count 1<br/>pending gap about 36ms]
+    BodyFuture --> BodyGap[p99 pending count 14<br/>pending gap about 14.6ms]
+    ReqGap --> ResponseWait[response_wait_p99 about 36ms]
+    ResponseWait --> Finding[tail is one long wait after request write<br/>not repeated poll churn]
+    Finding --> Next[wake source + conn id + thread id<br/>or sched_switch/sched_wakeup trace]
+    Next --> Status[O4b still incomplete]
+```
+
 ## M1 TLS 配置补齐
 
 状态：已完成。
@@ -446,6 +461,7 @@ CONNECT 高压当前结论：
 - 最新 strict CONNECT no-trace 5-run：ylong async-ylong 平均约 3709.6 rps，libcurl 平均约 3726.2 rps，平均约 -0.4%；5 次提升分别约 +9.6%、-6.3%、-0.1%、-1.4%、-3.1%，仍为 0/5 达到 20%+。
 - O4a HTTP target smoke 仍正常：20 request、4 concurrency 下 ylong 约 4753 rps，libcurl 约 1787 rps，说明本阶段没有破坏已完成路径。
 - off-CPU profiling 尝试发现当前用户仍无法读取 `/sys/kernel/tracing/events/sched/sched_switch/id`，因此 `perf sched record` 暂时不能运行；降级的 `/usr/bin/time -v` 和 `perf stat` 继续显示 ylong CPU 指标不差但 p99 更高。
+- benchmark 内部 Future Pending gap trace 已接入：request future p99 只有 1 次 Pending，但 Pending 到下一次 poll 的 gap p99 约 36ms，基本等于 `response_wait_p99`；body data future p99 Pending gap 约 14.6ms，是次要长尾。
 - 因此下一阶段重点从继续减少 body read 次数，转为 off-CPU scheduler latency、response first-byte wait、CONNECT 双 TLS readiness 传播和尾延迟归因。
 - O4a `HTTP target over HTTPS proxy` 已完成并冻结；后续优化不得扩大到该路径，除非用于回归验证。
 - O4b `HTTPS target over HTTPS proxy / CONNECT` 仍未完成；只有严格 CONNECT 场景 5 次中至少 4 次达到 20%+ 后，才能将全部 OKR 标记为 100% 完成。
@@ -454,7 +470,7 @@ CONNECT 高压当前结论：
 
 1. 冻结 HTTP target 256 KiB 与 CONNECT 64 KiB read-ahead 策略。
 2. 保留 request/body/pool 阶段 histogram，但正式吞吐验收不启用 `--trace-summary`。
-3. 放开 tracefs sched tracepoint 读取权限，或在 runtime/benchmark 内补 Pending-to-Ready gap histogram，确认 p99 差距是否来自 Pending/wake 间隔、任务迁移或双层 TLS readiness 传播。
+3. 放开 tracefs sched tracepoint 读取权限，或继续扩展 benchmark trace，记录 request Pending 返回时的 connection id、worker/thread id、TLS/BIO WANT_READ/WANT_WRITE 状态和 wake 来源。
 4. 若 off-CPU 证据指向 nested TLS readiness，再做 CONNECT-only progress loop；若证据指向调度，再收敛 runtime wake/worker 绑定策略；不要再扩大 ready-drain 预算或引入通用 `SSL_pending` drain。
 5. 每次优化后复跑 strict CONNECT 5 次，并保留 HTTP target smoke 作为已完成路径的回归保护。
 
