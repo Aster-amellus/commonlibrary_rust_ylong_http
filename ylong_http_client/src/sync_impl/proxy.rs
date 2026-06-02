@@ -20,7 +20,6 @@ use crate::{ErrorKind, HttpClientError, TlsConfig};
 
 pub(crate) const DEFAULT_READ_AHEAD_BUFFER: usize = 256 * 1024;
 pub(crate) const CONNECT_PROXY_READ_AHEAD_BUFFER: usize = 64 * 1024;
-pub(crate) const ORIGIN_TLS_READ_AHEAD_BUFFER: usize = 8 * 1024;
 
 pub(crate) fn connect_tls<S>(
     config: &TlsConfig,
@@ -114,6 +113,8 @@ where
 
     conn.write_all(&req)
         .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
+    conn.flush()
+        .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
 
     let mut buf = [0; 8192];
     let mut pos = 0;
@@ -153,5 +154,67 @@ where
                 "unsuccessful tunnel",
             ));
         }
+    }
+}
+
+#[cfg(all(test, feature = "__tls"))]
+mod ut_tunnel_flush {
+    use std::io::{self, Read, Write};
+
+    #[cfg(feature = "__c_openssl")]
+    use openssl as _;
+
+    use crate::sync_impl::proxy::tunnel;
+
+    const RESPONSE: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+
+    #[derive(Default)]
+    struct FlushGatedStream {
+        written: Vec<u8>,
+        flushed: bool,
+        read_pos: usize,
+    }
+
+    impl Read for FlushGatedStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.flushed {
+                return Ok(0);
+            }
+
+            let read = RESPONSE.len().saturating_sub(self.read_pos).min(buf.len());
+            let end = self.read_pos + read;
+            buf[..read].copy_from_slice(&RESPONSE[self.read_pos..end]);
+            self.read_pos = end;
+            Ok(read)
+        }
+    }
+
+    impl Write for FlushGatedStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushed = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ut_sync_tunnel_flushes_connect_request() {
+        let stream = tunnel(
+            FlushGatedStream::default(),
+            "example.com".to_string(),
+            443,
+            None,
+        )
+        .expect("tunnel should use flush before reading response");
+
+        assert!(stream.flushed);
+        assert_eq!(
+            stream.written,
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+        );
     }
 }

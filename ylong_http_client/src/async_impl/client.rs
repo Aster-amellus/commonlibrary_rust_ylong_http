@@ -30,7 +30,7 @@ use crate::util::config::{
     ClientConfig, ConnectorConfig, HttpConfig, HttpVersion, Proxy, Redirect, Timeout,
 };
 use crate::util::dispatcher::{Conn, TimeInfoConn};
-use crate::util::interceptor::{IdleInterceptor, Interceptor, Interceptors};
+use crate::util::interceptor::{Interceptor, InterceptorContext};
 use crate::util::normalizer::RequestFormatter;
 use crate::util::proxy::Proxies;
 use crate::util::redirect::{RedirectInfo, Trigger};
@@ -72,7 +72,7 @@ use crate::{ErrorKind, Retry};
 pub struct Client<C: Connector> {
     inner: ConnPool<C, C::Stream>,
     config: ClientConfig,
-    interceptors: Arc<Interceptors>,
+    interceptors: InterceptorContext,
 }
 
 impl Client<HttpConnector> {
@@ -137,7 +137,7 @@ impl<C: Connector> Client<C> {
         Self {
             inner: ConnPool::new(HttpConfig::default(), connector),
             config: ClientConfig::default(),
-            interceptors: Arc::new(IdleInterceptor),
+            interceptors: InterceptorContext::none(),
         }
     }
 
@@ -246,7 +246,7 @@ impl<C: Connector> Client<C> {
     ) -> Result<Response, HttpClientError> {
         let message = Message {
             request,
-            interceptor: Arc::clone(&self.interceptors),
+            interceptor: self.interceptors.clone(),
         };
         if let Some(timeout) = self.config.request_timeout.inner() {
             TimeoutFuture::new(
@@ -328,7 +328,7 @@ pub struct ClientBuilder {
     fchown: Option<FchownConfig>,
 
     /// Interceptor for all stages.
-    interceptors: Arc<Interceptors>,
+    interceptors: InterceptorContext,
     /// Resolver to http DNS.
     resolver: Arc<dyn Resolver>,
 
@@ -354,7 +354,7 @@ impl ClientBuilder {
             proxies: Proxies::default(),
             #[cfg(all(target_os = "linux", feature = "ylong_base", feature = "__tls"))]
             fchown: None,
-            interceptors: Arc::new(IdleInterceptor),
+            interceptors: InterceptorContext::none(),
             resolver: Arc::new(DefaultDnsResolver::default()),
             #[cfg(feature = "__tls")]
             tls: crate::util::TlsConfig::builder(),
@@ -582,7 +582,7 @@ impl ClientBuilder {
     where
         T: Interceptor + Sync + Send + 'static,
     {
-        self.interceptors = Arc::new(interceptors);
+        self.interceptors = InterceptorContext::new(interceptors);
         self
     }
 
@@ -1111,13 +1111,11 @@ mod ut_async_impl_client {
 
     #[cfg(feature = "ylong_base")]
     async fn client_request_redirect() {
-        use std::sync::Arc;
-
         use ylong_http::h1::ResponseDecoder;
         use ylong_http::response::Response as HttpResponse;
 
         use crate::async_impl::{ClientBuilder, HttpBody};
-        use crate::util::interceptor::IdleInterceptor;
+        use crate::util::interceptor::InterceptorContext;
         use crate::util::normalizer::BodyLength;
         use crate::util::request::RequestArc;
         use crate::util::Redirect;
@@ -1129,7 +1127,7 @@ mod ut_async_impl_client {
         let box_stream = Box::new("hello world".as_bytes());
         let content_bytes = "";
         let until_close = HttpBody::new(
-            Arc::new(IdleInterceptor),
+            InterceptorContext::none(),
             BodyLength::UntilClose,
             box_stream,
             content_bytes.as_bytes(),

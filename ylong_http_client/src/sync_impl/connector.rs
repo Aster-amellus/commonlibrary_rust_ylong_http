@@ -99,7 +99,7 @@ pub mod tls_conn {
 
     use crate::sync_impl::proxy::{
         connect_tls, connect_tls_with_read_ahead, connect_tls_with_read_ahead_buffer, tunnel,
-        CONNECT_PROXY_READ_AHEAD_BUFFER, ORIGIN_TLS_READ_AHEAD_BUFFER,
+        CONNECT_PROXY_READ_AHEAD_BUFFER,
     };
     use crate::sync_impl::{Connector, MixStream};
     use crate::util::pool::PoolKey;
@@ -174,12 +174,11 @@ pub mod tls_conn {
                             CONNECT_PROXY_READ_AHEAD_BUFFER,
                         )?;
                         let tunneled = tunnel(proxy_tls, host.clone(), port, auth)?;
-                        let origin_tls = connect_tls_with_read_ahead_buffer(
+                        let origin_tls = connect_tls(
                             &self.config.tls,
                             host.as_str(),
                             tunneled,
                             origin_pin_host.as_str(),
-                            ORIGIN_TLS_READ_AHEAD_BUFFER,
                         )?;
                         Ok(MixStream::HttpsOverProxy(origin_tls))
                     } else {

@@ -284,7 +284,7 @@ mod tls {
     use crate::async_impl::mix::MixStream;
     use crate::async_impl::proxy::{
         connect_tls, connect_tls_with_read_ahead, connect_tls_with_read_ahead_buffer, tunnel,
-        CONNECT_PROXY_READ_AHEAD_BUFFER, ORIGIN_TLS_READ_AHEAD_BUFFER,
+        CONNECT_PROXY_READ_AHEAD_BUFFER,
     };
     #[cfg(feature = "http3")]
     use crate::async_impl::quic::QuicConn;
@@ -532,14 +532,8 @@ mod tls {
             let tunneled = tunnel(proxy_tls, &host, port, auth)
                 .await
                 .map_err(|e| HttpClientError::from_io_error(crate::ErrorKind::Connect, e))?;
-            let origin_tls = connect_tls_with_read_ahead_buffer(
-                config,
-                host.as_str(),
-                tunneled,
-                origin_pin_host.as_str(),
-                ORIGIN_TLS_READ_AHEAD_BUFFER,
-            )
-            .await?;
+            let origin_tls =
+                connect_tls(config, host.as_str(), tunneled, origin_pin_host.as_str()).await?;
             MixStream::HttpsOverProxy(origin_tls)
         } else {
             let tcp = if is_proxy {

@@ -13,7 +13,6 @@
 
 use std::mem::take;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -32,7 +31,7 @@ use crate::runtime::{poll_fn, AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::util::config::HttpVersion;
 use crate::util::dispatcher::http1::Http1Conn;
 use crate::util::information::ConnInfo;
-use crate::util::interceptor::Interceptors;
+use crate::util::interceptor::InterceptorContext;
 use crate::util::normalizer::BodyLengthParser;
 use crate::ErrorKind::BodyTransfer;
 
@@ -171,6 +170,10 @@ where
         .map(|v| v.contains("chunked"))
         .unwrap_or(false);
 
+    if !transfer_encoding && request.body().is_empty() {
+        return Ok(());
+    }
+
     let body = request.body_mut();
 
     match (content_length, transfer_encoding) {
@@ -192,7 +195,7 @@ where
 
 async fn encode_request_part<S>(
     request: &Request,
-    interceptor: &Arc<Interceptors>,
+    interceptor: &InterceptorContext,
     conn: &mut Http1Conn<S>,
     buf: &mut [u8],
 ) -> Result<(), HttpClientError>

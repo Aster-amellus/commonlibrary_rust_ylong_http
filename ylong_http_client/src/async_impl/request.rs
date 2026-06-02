@@ -17,7 +17,6 @@ use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::io::Cursor;
-use std::sync::Arc;
 
 use ylong_http::body::async_impl::ReusableReader;
 use ylong_http::body::MultiPartBase;
@@ -26,7 +25,7 @@ use ylong_http::request::{Request as Req, RequestBuilder as ReqBuilder};
 
 use crate::error::{ErrorKind, HttpClientError};
 use crate::runtime::{AsyncRead, ReadBuf};
-use crate::util::interceptor::Interceptors;
+use crate::util::interceptor::InterceptorContext;
 use crate::util::monitor::TimeGroup;
 use crate::util::request::RequestArc;
 
@@ -350,7 +349,6 @@ impl Body {
         Self { inner }
     }
 
-    #[cfg(feature = "http2")]
     pub(crate) fn is_empty(&self) -> bool {
         match self.inner {
             BodyKind::Empty => true,
@@ -418,7 +416,7 @@ impl PercentEncoder {
 
 pub(crate) struct Message {
     pub(crate) request: RequestArc,
-    pub(crate) interceptor: Arc<Interceptors>,
+    pub(crate) interceptor: InterceptorContext,
 }
 
 #[cfg(feature = "ylong_base")]

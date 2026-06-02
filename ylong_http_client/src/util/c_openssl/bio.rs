@@ -194,7 +194,10 @@ unsafe extern "C" fn ctrl<S: Write>(
                 state.error = Some(err);
                 0
             }
-            Ok(Ok(())) => 1,
+            Ok(Ok(())) => {
+                state.error = None;
+                1
+            }
             Err(err) => {
                 state.panic = Some(err);
                 0
@@ -239,7 +242,10 @@ macro_rules! catch_unwind_bio {
                 $state.error = Some(err);
                 -1
             }
-            Ok(Ok(len)) => len as c_int,
+            Ok(Ok(len)) => {
+                $state.error = None;
+                len as c_int
+            }
             Err(err) => {
                 $state.panic = Some(err);
                 -1
@@ -467,6 +473,20 @@ mod ut_bio {
         }
     }
 
+    #[test]
+    fn ut_ctrl_flush_clears_stale_error() {
+        let stream = Cursor::new(vec![0u8; 10]);
+        let (bio, _method) = new(stream).unwrap();
+        unsafe {
+            let state = get_state::<Cursor<Vec<u8>>>(bio);
+            state.error = Some(io::Error::new(io::ErrorKind::WouldBlock, "stale"));
+            let res = ctrl::<Cursor<Vec<u8>>>(bio, BIO_CTRL_FLUSH, 0, std::ptr::null_mut());
+            assert_eq!(res, 1);
+            assert!(get_error::<Cursor<Vec<u8>>>(bio).is_none());
+            BIO_free_all(bio);
+        }
+    }
+
     /// UT test case for `ctrl` with `BIO_CTRL_DGRAM_QUERY`.
     ///
     /// # Brief
@@ -523,6 +543,22 @@ mod ut_bio {
         }
     }
 
+    #[test]
+    fn ut_bwrite_clears_stale_error() {
+        let stream = Cursor::new(vec![0u8; 10]);
+        let (bio, _method) = new(stream).unwrap();
+        let data = b"TEST TEST";
+        let len = data.len() as c_int;
+        unsafe {
+            let state = get_state::<Cursor<Vec<u8>>>(bio);
+            state.error = Some(io::Error::new(io::ErrorKind::WouldBlock, "stale"));
+            let res = bwrite::<Cursor<Vec<u8>>>(bio, data.as_ptr() as *const c_char, len);
+            assert_eq!(res, len);
+            assert!(get_error::<Cursor<Vec<u8>>>(bio).is_none());
+            BIO_free_all(bio);
+        }
+    }
+
     /// UT test case for `bread`.
     ///
     /// # Brief
@@ -539,6 +575,23 @@ mod ut_bio {
             let res = bread::<Cursor<Vec<u8>>>(bio, buf.as_mut_ptr() as *mut c_char, len);
             assert_eq!(res, len);
             assert_eq!(buf, data);
+            BIO_free_all(bio);
+        }
+    }
+
+    #[test]
+    fn ut_bread_clears_stale_error() {
+        let data = b"TEST TEST".to_vec();
+        let stream = Cursor::new(data.clone());
+        let (bio, _method) = new(stream).unwrap();
+        let mut buf = vec![0u8; data.len()];
+        let len = data.len() as c_int;
+        unsafe {
+            let state = get_state::<Cursor<Vec<u8>>>(bio);
+            state.error = Some(io::Error::new(io::ErrorKind::WouldBlock, "stale"));
+            let res = bread::<Cursor<Vec<u8>>>(bio, buf.as_mut_ptr() as *mut c_char, len);
+            assert_eq!(res, len);
+            assert!(get_error::<Cursor<Vec<u8>>>(bio).is_none());
             BIO_free_all(bio);
         }
     }

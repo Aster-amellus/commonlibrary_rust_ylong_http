@@ -41,6 +41,7 @@ ylong_base = ["ylong_runtime", "ylong_http/ylong_base"]          # Uses ylong ru
 tls_default = ["c_openssl_3_0"]
 __tls = []                              # Not open to user, only mark to use tls for developer.
 __c_openssl = ["__tls", "libc"]         # Not open to user, only mark to use tls by C-openssl for developer.
+__ylong_current_thread_runtime = ["ylong_runtime/current_thread_runtime"]
 c_openssl_1_1 = ["__c_openssl"]         # Uses TLS by FFI of C-openssl 1.1.
 c_openssl_3_0 = ["__c_openssl"]         # Uses TLS by FFI of C-openssl 3.0.
 c_boringssl = ["__tls", "libc"]

@@ -24,7 +24,6 @@ use crate::{HttpClientError, TlsConfig};
 
 pub(crate) const DEFAULT_READ_AHEAD_BUFFER: usize = 256 * 1024;
 pub(crate) const CONNECT_PROXY_READ_AHEAD_BUFFER: usize = 64 * 1024;
-pub(crate) const ORIGIN_TLS_READ_AHEAD_BUFFER: usize = 8 * 1024;
 
 pub(crate) async fn connect_tls<S>(
     config: TlsConfig,
@@ -123,6 +122,7 @@ where
     write!(&mut req, "\r\n")?;
 
     conn.write_all(&req).await?;
+    conn.flush().await?;
 
     let mut buf = [0; 8192];
     let mut pos = 0;
@@ -214,5 +214,83 @@ mod ut_tunnel_error_debug {
             format!("{}", CreateTunnelErr::Unsuccessful),
             "Unsuccessful tunnel"
         );
+    }
+}
+
+#[cfg(all(test, feature = "__tls", feature = "ylong_base"))]
+mod ut_tunnel_flush {
+    use core::pin::Pin;
+    use std::io;
+    use std::task::{Context, Poll};
+
+    #[cfg(feature = "__c_openssl")]
+    use openssl as _;
+
+    use crate::async_impl::proxy::tunnel;
+    use crate::runtime::{AsyncRead, AsyncWrite, ReadBuf};
+
+    const RESPONSE: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+
+    #[derive(Default)]
+    struct FlushGatedStream {
+        written: Vec<u8>,
+        flushed: bool,
+        read_pos: usize,
+    }
+
+    impl AsyncRead for FlushGatedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !self.flushed {
+                return Poll::Ready(Ok(()));
+            }
+
+            let read = RESPONSE
+                .len()
+                .saturating_sub(self.read_pos)
+                .min(buf.remaining());
+            let end = self.read_pos + read;
+            buf.append(&RESPONSE[self.read_pos..end]);
+            self.read_pos = end;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for FlushGatedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushed = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn ut_async_tunnel_flushes_connect_request() {
+        ylong_runtime::block_on(async {
+            let stream = tunnel(FlushGatedStream::default(), "example.com", 443, None)
+                .await
+                .unwrap();
+
+            assert!(stream.flushed);
+            assert_eq!(
+                stream.written,
+                b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+            );
+        });
     }
 }

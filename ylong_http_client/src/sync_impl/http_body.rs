@@ -13,7 +13,7 @@
 
 use std::io::{Cursor, Read};
 
-use ylong_http::body::{ChunkBodyDecoder, ChunkState, TextBodyDecoder};
+use ylong_http::body::{ChunkBodyDecoder, ChunkState};
 use ylong_http::headers::Headers;
 
 use super::Body;
@@ -77,7 +77,7 @@ enum Kind {
 }
 
 struct Text {
-    decoder: TextBodyDecoder,
+    remaining: u64,
     pre: Option<Cursor<Vec<u8>>>,
     io: Option<BoxStreamData>,
 }
@@ -85,7 +85,7 @@ struct Text {
 impl Text {
     pub(crate) fn new(len: u64, pre: &[u8], io: BoxStreamData) -> Self {
         Self {
-            decoder: TextBodyDecoder::new(len),
+            remaining: len,
             pre: (!pre.is_empty()).then_some(Cursor::new(pre.to_vec())),
             io: Some(io),
         }
@@ -132,20 +132,18 @@ impl Text {
                 self.pre = None;
             } else {
                 read += this_read;
-                let (text, rem) = self.decoder.decode(&buf[..read]);
-
-                match (text.is_complete(), rem.is_empty()) {
-                    (true, false) => {
-                        if let Some(io) = self.io.take() {
-                            io.shutdown();
-                        };
-                        return Err(HttpClientError::from_str(ErrorKind::BodyDecode, "Not Eof"));
-                    }
-                    (true, true) => {
+                match self.consume(read) {
+                    Ok(true) => {
                         self.io = None;
                         return Ok(read);
                     }
-                    _ => {}
+                    Ok(false) => {}
+                    Err(e) => {
+                        if let Some(io) = self.io.take() {
+                            io.shutdown();
+                        };
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -162,19 +160,14 @@ impl Text {
                         ));
                     }
                     Ok(filled) => {
-                        let (text, rem) = self.decoder.decode(&buf[read..read + filled]);
                         read += filled;
-                        // Contains redundant `rem`, return error.
-                        match (text.is_complete(), rem.is_empty()) {
-                            (true, false) => {
+                        match self.consume(filled) {
+                            Ok(true) => return Ok(read),
+                            Ok(false) => {}
+                            Err(e) => {
                                 io.shutdown();
-                                return Err(HttpClientError::from_str(
-                                    ErrorKind::BodyDecode,
-                                    "Not Eof",
-                                ));
+                                return Err(e);
                             }
-                            (true, true) => return Ok(read),
-                            _ => {}
                         }
                         self.io = Some(io);
                     }
@@ -183,6 +176,15 @@ impl Text {
             }
         }
         Ok(read)
+    }
+
+    fn consume(&mut self, filled: usize) -> Result<bool, HttpClientError> {
+        if filled as u64 > self.remaining {
+            self.remaining = 0;
+            return Err(HttpClientError::from_str(ErrorKind::BodyDecode, "Not Eof"));
+        }
+        self.remaining -= filled as u64;
+        Ok(self.remaining == 0)
     }
 }
 
@@ -320,7 +322,13 @@ impl Chunk {
 
 #[cfg(test)]
 mod ut_syn_http_body {
+    use crate::error::ErrorKind;
+    use crate::sync_impl::conn::StreamData;
     use crate::sync_impl::{Body, HttpBody};
+
+    impl StreamData for &[u8] {
+        fn shutdown(&self) {}
+    }
 
     /// UT test cases for `HttpBody::empty`.
     ///
@@ -335,5 +343,32 @@ mod ut_syn_http_body {
         let data = body.data(&mut buf);
         assert!(data.is_ok());
         assert_eq!(data.unwrap(), 0);
+    }
+
+    #[test]
+    fn ut_http_body_text() {
+        let mut body = HttpBody::text(11, b"", Box::new("hello world".as_bytes()));
+        let mut buf = [0u8; 5];
+        assert_eq!(body.data(&mut buf).unwrap(), 5);
+        assert_eq!(body.data(&mut buf).unwrap(), 5);
+        assert_eq!(body.data(&mut buf).unwrap(), 1);
+        assert_eq!(body.data(&mut buf).unwrap(), 0);
+
+        let mut body = HttpBody::text(5, b"hello", Box::new("".as_bytes()));
+        let mut buf = [0u8; 32];
+        assert_eq!(body.data(&mut buf).unwrap(), 5);
+        assert_eq!(body.data(&mut buf).unwrap(), 0);
+
+        let mut body = HttpBody::text(5, b"hello!", Box::new("".as_bytes()));
+        assert_eq!(
+            body.data(&mut buf).unwrap_err().error_kind(),
+            ErrorKind::BodyDecode
+        );
+
+        let mut body = HttpBody::text(5, b"", Box::new("hello!".as_bytes()));
+        assert_eq!(
+            body.data(&mut buf).unwrap_err().error_kind(),
+            ErrorKind::BodyDecode
+        );
     }
 }

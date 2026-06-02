@@ -14,7 +14,7 @@
 //! Synchronous HTTPS proxy benchmark client for comparison with libcurl.
 
 use std::env;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -51,6 +51,15 @@ struct WorkerResult {
     bytes: u64,
     body_reads: u64,
     errors: usize,
+    start_delay_us: u128,
+    elapsed_us: u128,
+}
+
+#[derive(Clone)]
+struct StartGate {
+    ready: Arc<Barrier>,
+    start: Arc<Barrier>,
+    started: Arc<Mutex<Option<Instant>>>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(
-        "{{\"client\":\"ylong_http_client_sync\",\"url\":\"{}\",\"proxy\":\"{}\",\"method\":\"{}\",\"body_size\":{},\"requests\":{},\"warmup_requests\":{},\"completed\":{},\"errors\":{},\"concurrency\":{},\"runtime_threads\":{},\"read_buffer_size\":{},\"prebuilt_requests\":{},\"bytes\":{},\"body_reads\":{},\"avg_body_read_size\":{:.3},\"elapsed_ms\":{:.3},\"rps\":{:.3},\"latency_us_p50\":{},\"latency_us_p90\":{},\"latency_us_p95\":{},\"latency_us_p99\":{}}}",
+        "{{\"client\":\"ylong_http_client_sync\",\"url\":\"{}\",\"proxy\":\"{}\",\"method\":\"{}\",\"body_size\":{},\"requests\":{},\"warmup_requests\":{},\"completed\":{},\"errors\":{},\"concurrency\":{},\"runtime_threads\":{},\"read_buffer_size\":{},\"prebuilt_requests\":{},\"bytes\":{},\"body_reads\":{},\"avg_body_read_size\":{:.3},\"elapsed_ms\":{:.3},\"rps\":{:.3},\"latency_us_p50\":{},\"latency_us_p90\":{},\"latency_us_p95\":{},\"latency_us_p99\":{},\"worker_start_delay_us_min\":{},\"worker_start_delay_us_max\":{},\"worker_elapsed_us_min\":{},\"worker_elapsed_us_max\":{}}}",
         escape_json(&config.url),
         escape_json(&config.proxy),
         escape_json(&config.method),
@@ -98,6 +107,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         percentile(&latencies, 90),
         percentile(&latencies, 95),
         percentile(&latencies, 99),
+        min_u128(&result.worker_start_delay_us),
+        max_u128(&result.worker_start_delay_us),
+        min_u128(&result.worker_elapsed_us),
+        max_u128(&result.worker_elapsed_us),
     );
 
     Ok(())
@@ -108,35 +121,49 @@ struct WorkloadResult {
     bytes: u64,
     body_reads: u64,
     errors: usize,
+    worker_start_delay_us: Vec<u128>,
+    worker_elapsed_us: Vec<u128>,
     elapsed: std::time::Duration,
 }
 
 fn run_workload(config: Arc<Config>) -> WorkloadResult {
-    let barrier = Arc::new(Barrier::new(config.concurrency + 1));
+    let gate = StartGate {
+        ready: Arc::new(Barrier::new(config.concurrency + 1)),
+        start: Arc::new(Barrier::new(config.concurrency + 1)),
+        started: Arc::new(Mutex::new(None)),
+    };
     let mut handles = Vec::with_capacity(config.concurrency);
     for worker in 0..config.concurrency {
         let measured_count = requests_for_worker(config.requests, config.concurrency, worker);
         let warmup_count = requests_for_worker(config.warmup_requests, config.concurrency, worker);
         let config = config.clone();
-        let barrier = barrier.clone();
+        let gate = gate.clone();
         handles.push(std::thread::spawn(move || {
-            run_worker(config, warmup_count, measured_count, barrier)
+            run_worker(config, warmup_count, measured_count, gate)
         }));
     }
 
-    barrier.wait();
+    gate.ready.wait();
     let started = Instant::now();
+    *gate.started.lock().unwrap() = Some(started);
+    gate.start.wait();
 
     let mut latencies_us = Vec::with_capacity(config.requests);
     let mut bytes = 0;
     let mut body_reads = 0;
     let mut errors = 0;
+    let mut worker_start_delay_us = Vec::with_capacity(config.concurrency);
+    let mut worker_elapsed_us = Vec::with_capacity(config.concurrency);
     for handle in handles {
         let result = join_worker(handle);
         latencies_us.extend(result.latencies_us);
         bytes += result.bytes;
         body_reads += result.body_reads;
         errors += result.errors;
+        worker_start_delay_us.push(result.start_delay_us);
+        if result.elapsed_us != 0 {
+            worker_elapsed_us.push(result.elapsed_us);
+        }
     }
 
     WorkloadResult {
@@ -144,39 +171,43 @@ fn run_workload(config: Arc<Config>) -> WorkloadResult {
         bytes,
         body_reads,
         errors,
+        worker_start_delay_us,
+        worker_elapsed_us,
         elapsed: started.elapsed(),
     }
 }
 
 fn build_client(config: &Config) -> Result<Client<impl Connector>, HttpClientError> {
-    let mut proxy_tls = TlsConfig::builder();
-    if let Some(path) = &config.proxy_ca_file {
-        proxy_tls = proxy_tls.ca_file(path);
-    }
-    if let Some(path) = &config.proxy_client_cert {
-        proxy_tls = proxy_tls.certificate_chain_file(path);
-    }
-    if let Some(path) = &config.proxy_client_key {
-        proxy_tls = proxy_tls.private_key_file(path, TlsFileType::PEM);
-    }
-    if config.insecure_proxy {
-        proxy_tls = proxy_tls
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true);
-    }
+    let mut builder = ClientBuilder::new();
+    if !config.proxy.is_empty() {
+        let mut proxy_tls = TlsConfig::builder();
+        if let Some(path) = &config.proxy_ca_file {
+            proxy_tls = proxy_tls.ca_file(path);
+        }
+        if let Some(path) = &config.proxy_client_cert {
+            proxy_tls = proxy_tls.certificate_chain_file(path);
+        }
+        if let Some(path) = &config.proxy_client_key {
+            proxy_tls = proxy_tls.private_key_file(path, TlsFileType::PEM);
+        }
+        if config.insecure_proxy {
+            proxy_tls = proxy_tls
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true);
+        }
 
-    let mut proxy = Proxy::all(&config.proxy).proxy_tls_config(proxy_tls.build()?);
-    if let Some(user_pass) = &config.proxy_user_pass {
-        let (username, password) = user_pass.split_once(':').ok_or_else(|| {
-            HttpClientError::other(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "proxy user pass must be username:password",
-            ))
-        })?;
-        proxy = proxy.basic_auth(username, password);
+        let mut proxy = Proxy::all(&config.proxy).proxy_tls_config(proxy_tls.build()?);
+        if let Some(user_pass) = &config.proxy_user_pass {
+            let (username, password) = user_pass.split_once(':').ok_or_else(|| {
+                HttpClientError::other(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "proxy user pass must be username:password",
+                ))
+            })?;
+            proxy = proxy.basic_auth(username, password);
+        }
+        builder = builder.proxy(proxy.build()?);
     }
-
-    let mut builder = ClientBuilder::new().proxy(proxy.build()?);
     if let Some(path) = &config.origin_ca_file {
         builder = builder.tls_ca_file(path);
     }
@@ -192,15 +223,19 @@ fn run_worker(
     config: Arc<Config>,
     warmup_count: usize,
     measured_count: usize,
-    barrier: Arc<Barrier>,
+    gate: StartGate,
 ) -> WorkerResult {
     let Ok(client) = build_client(&config) else {
-        barrier.wait();
+        gate.ready.wait();
+        gate.start.wait();
+        let start_delay_us = current_start_delay(&gate);
         return WorkerResult {
             latencies_us: Vec::new(),
             bytes: 0,
             body_reads: 0,
             errors: warmup_count + measured_count,
+            start_delay_us,
+            elapsed_us: 0,
         };
     };
     let mut read_buffer = vec![0; config.read_buffer_size];
@@ -217,12 +252,16 @@ fn run_worker(
             match Request::get(config.url.as_str()).body(EmptyBody) {
                 Ok(request) => requests.push(request),
                 Err(_) => {
-                    barrier.wait();
+                    gate.ready.wait();
+                    gate.start.wait();
+                    let start_delay_us = current_start_delay(&gate);
                     return WorkerResult {
                         latencies_us: Vec::new(),
                         bytes: 0,
                         body_reads: 0,
                         errors: errors + measured_count,
+                        start_delay_us,
+                        elapsed_us: 0,
                     };
                 }
             }
@@ -232,13 +271,18 @@ fn run_worker(
         None
     };
 
-    barrier.wait();
+    gate.ready.wait();
+    gate.start.wait();
+    let measured_started = gate.started.lock().unwrap().unwrap();
+    let start_delay_us = measured_started.elapsed().as_micros();
 
     let mut result = WorkerResult {
         latencies_us: Vec::with_capacity(measured_count),
         bytes: 0,
         body_reads: 0,
         errors,
+        start_delay_us,
+        elapsed_us: 0,
     };
     if let Some(requests) = measured_requests {
         for request in requests {
@@ -265,7 +309,16 @@ fn run_worker(
             }
         }
     }
+    result.elapsed_us = measured_started.elapsed().as_micros();
     result
+}
+
+fn current_start_delay(gate: &StartGate) -> u128 {
+    gate.started
+        .lock()
+        .unwrap()
+        .map(|started| started.elapsed().as_micros())
+        .unwrap_or_default()
 }
 
 fn request_once<C>(
@@ -340,6 +393,8 @@ fn join_worker(handle: JoinHandle<WorkerResult>) -> WorkerResult {
         bytes: 0,
         body_reads: 0,
         errors: 1,
+        start_delay_us: 0,
+        elapsed_us: 0,
     })
 }
 
@@ -359,6 +414,14 @@ fn average_read_size(bytes: u64, body_reads: u64) -> f64 {
     } else {
         bytes as f64 / body_reads as f64
     }
+}
+
+fn min_u128(values: &[u128]) -> u128 {
+    values.iter().copied().min().unwrap_or_default()
+}
+
+fn max_u128(values: &[u128]) -> u128 {
+    values.iter().copied().max().unwrap_or_default()
 }
 
 fn parse_args(args: Vec<String>) -> Result<Config, String> {
@@ -442,9 +505,6 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
     if config.url.is_empty() {
         return Err("missing --url".to_string());
     }
-    if config.proxy.is_empty() {
-        return Err("missing --proxy".to_string());
-    }
     if config.requests == 0 {
         return Err("--requests must be greater than 0".to_string());
     }
@@ -495,5 +555,5 @@ fn escape_json(value: &str) -> String {
 }
 
 fn usage() -> &'static str {
-    "usage: sync_https_proxy_bench --url URL --proxy https://PROXY[:PORT] [--requests N] [--warmup-requests N] [--concurrency N] [--runtime-threads N] [--read-buffer-size N] [--method GET|POST] [--body-size N] [--proxy-ca-file PEM] [--proxy-client-cert PEM] [--proxy-client-key PEM] [--origin-ca-file PEM] [--insecure-proxy] [--insecure-origin] [--proxy-user-pass user:pass]"
+    "usage: sync_https_proxy_bench --url URL [--proxy http[s]://PROXY[:PORT]] [--requests N] [--warmup-requests N] [--concurrency N] [--runtime-threads N] [--read-buffer-size N] [--method GET|POST] [--body-size N] [--proxy-ca-file PEM] [--proxy-client-cert PEM] [--proxy-client-key PEM] [--origin-ca-file PEM] [--insecure-proxy] [--insecure-origin] [--proxy-user-pass user:pass]"
 }

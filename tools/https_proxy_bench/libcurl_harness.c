@@ -20,6 +20,7 @@ typedef struct {
     const char *proxy_client_key;
     const char *origin_ca_file;
     const char *proxy_user_pass;
+    long proxy_type;
     long insecure_proxy;
     long insecure_origin;
     size_t requests;
@@ -32,15 +33,23 @@ typedef struct {
 
 typedef struct {
     const Config *config;
-    pthread_barrier_t *barrier;
+    pthread_barrier_t *ready_barrier;
+    pthread_barrier_t *start_barrier;
+    uint64_t *started_us;
     size_t start;
     size_t count;
     size_t warmup_count;
     uint64_t *latencies_us;
+    uint64_t *connect_us;
+    uint64_t *appconnect_us;
+    uint64_t *starttransfer_us;
+    uint64_t *total_time_us;
+    uint64_t *body_transfer_us;
     char *body;
     struct curl_slist *headers;
     uint64_t bytes;
     uint64_t body_reads;
+    uint64_t start_delay_us;
     uint64_t elapsed_us;
     size_t completed;
     size_t errors;
@@ -78,13 +87,27 @@ static uint64_t percentile(const uint64_t *values, size_t len, size_t pct)
     return values[((len - 1) * pct) / 100];
 }
 
+static uint64_t curl_time_us(CURL *curl, CURLINFO info)
+{
+    curl_off_t us = 0;
+    CURLcode code = curl_easy_getinfo(curl, info, &us);
+    if (code != CURLE_OK || us <= 0) {
+        return 0;
+    }
+    return (uint64_t)us;
+}
+
 static void set_common_options(CURL *curl, Worker *worker)
 {
     const Config *config = worker->config;
 
     curl_easy_setopt(curl, CURLOPT_URL, config->url);
-    curl_easy_setopt(curl, CURLOPT_PROXY, config->proxy);
-    curl_easy_setopt(curl, CURLOPT_PROXYTYPE, CURLPROXY_HTTPS);
+    if (config->proxy != NULL) {
+        curl_easy_setopt(curl, CURLOPT_PROXY, config->proxy);
+        curl_easy_setopt(curl, CURLOPT_PROXYTYPE, config->proxy_type);
+    } else {
+        curl_easy_setopt(curl, CURLOPT_PROXY, "");
+    }
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
@@ -124,13 +147,24 @@ static void set_common_options(CURL *curl, Worker *worker)
     }
 }
 
+static uint64_t wait_for_measured_start(Worker *worker)
+{
+    pthread_barrier_wait(worker->ready_barrier);
+    pthread_barrier_wait(worker->start_barrier);
+    uint64_t measured_started = *worker->started_us;
+    uint64_t started_now = now_us();
+    worker->start_delay_us =
+        started_now >= measured_started ? started_now - measured_started : 0;
+    return measured_started;
+}
+
 static void *run_worker(void *arg)
 {
     Worker *worker = (Worker *)arg;
     CURL *curl = curl_easy_init();
     if (curl == NULL) {
         worker->errors += worker->warmup_count + worker->count;
-        pthread_barrier_wait(worker->barrier);
+        wait_for_measured_start(worker);
         return NULL;
     }
 
@@ -138,7 +172,7 @@ static void *run_worker(void *arg)
         worker->body = malloc(worker->config->body_size);
         if (worker->body == NULL) {
             worker->errors += worker->warmup_count + worker->count;
-            pthread_barrier_wait(worker->barrier);
+            wait_for_measured_start(worker);
             curl_easy_cleanup(curl);
             return NULL;
         }
@@ -155,14 +189,22 @@ static void *run_worker(void *arg)
     }
     worker->bytes = 0;
     worker->body_reads = 0;
-    pthread_barrier_wait(worker->barrier);
-    uint64_t measured_started = now_us();
+    uint64_t measured_started = wait_for_measured_start(worker);
 
     for (size_t i = 0; i < worker->count; i++) {
         uint64_t started = now_us();
         CURLcode code = curl_easy_perform(curl);
         if (code == CURLE_OK) {
-            worker->latencies_us[worker->start + worker->completed] = now_us() - started;
+            size_t index = worker->start + worker->completed;
+            uint64_t total_us = curl_time_us(curl, CURLINFO_TOTAL_TIME_T);
+            uint64_t starttransfer_us = curl_time_us(curl, CURLINFO_STARTTRANSFER_TIME_T);
+            worker->latencies_us[index] = now_us() - started;
+            worker->connect_us[index] = curl_time_us(curl, CURLINFO_CONNECT_TIME_T);
+            worker->appconnect_us[index] = curl_time_us(curl, CURLINFO_APPCONNECT_TIME_T);
+            worker->starttransfer_us[index] = starttransfer_us;
+            worker->total_time_us[index] = total_us;
+            worker->body_transfer_us[index] =
+                total_us > starttransfer_us ? total_us - starttransfer_us : 0;
             worker->completed++;
         } else {
             worker->errors++;
@@ -189,7 +231,7 @@ static const char *next_value(int *index, int argc, char **argv, const char *nam
 static void usage(const char *program)
 {
     fprintf(stderr,
-            "usage: %s --url URL --proxy https://PROXY[:PORT] [--requests N] "
+            "usage: %s --url URL [--proxy http[s]://PROXY[:PORT]] [--requests N] "
             "[--concurrency N] [--proxy-ca-file PEM] [--proxy-client-cert PEM] "
             "[--proxy-client-key PEM] [--origin-ca-file PEM] [--insecure-proxy] "
             "[--insecure-origin] [--proxy-user-pass user:pass] [--method GET|POST] "
@@ -254,10 +296,20 @@ static Config parse_args(int argc, char **argv)
         }
     }
 
-    if (config.url == NULL || config.proxy == NULL || config.requests == 0 ||
-        config.concurrency == 0 || config.read_buffer_size == 0) {
+    if (config.url == NULL || config.requests == 0 || config.concurrency == 0 ||
+        config.read_buffer_size == 0) {
         usage(argv[0]);
         exit(2);
+    }
+    if (config.proxy != NULL) {
+        if (strncmp(config.proxy, "https://", strlen("https://")) == 0) {
+            config.proxy_type = CURLPROXY_HTTPS;
+        } else if (strncmp(config.proxy, "http://", strlen("http://")) == 0) {
+            config.proxy_type = CURLPROXY_HTTP;
+        } else {
+            fprintf(stderr, "--proxy must start with http:// or https://\n");
+            exit(2);
+        }
     }
     if (config.runtime_threads == 0) {
         config.runtime_threads = config.concurrency;
@@ -279,13 +331,27 @@ int main(int argc, char **argv)
     pthread_t *threads = calloc(config.concurrency, sizeof(pthread_t));
     Worker *workers = calloc(config.concurrency, sizeof(Worker));
     uint64_t *latencies = calloc(config.requests, sizeof(uint64_t));
-    pthread_barrier_t barrier;
-    if (threads == NULL || workers == NULL || latencies == NULL) {
+    uint64_t *connect_us = calloc(config.requests, sizeof(uint64_t));
+    uint64_t *appconnect_us = calloc(config.requests, sizeof(uint64_t));
+    uint64_t *starttransfer_us = calloc(config.requests, sizeof(uint64_t));
+    uint64_t *total_time_us = calloc(config.requests, sizeof(uint64_t));
+    uint64_t *body_transfer_us = calloc(config.requests, sizeof(uint64_t));
+    pthread_barrier_t ready_barrier;
+    pthread_barrier_t start_barrier;
+    uint64_t started = 0;
+    if (threads == NULL || workers == NULL || latencies == NULL || connect_us == NULL ||
+        appconnect_us == NULL || starttransfer_us == NULL || total_time_us == NULL ||
+        body_transfer_us == NULL) {
         fprintf(stderr, "allocation failed\n");
         return 2;
     }
-    if (pthread_barrier_init(&barrier, NULL, (unsigned int)config.concurrency + 1) != 0) {
+    if (pthread_barrier_init(&ready_barrier, NULL, (unsigned int)config.concurrency + 1) != 0) {
         fprintf(stderr, "barrier init failed\n");
+        return 2;
+    }
+    if (pthread_barrier_init(&start_barrier, NULL, (unsigned int)config.concurrency + 1) != 0) {
+        fprintf(stderr, "barrier init failed\n");
+        pthread_barrier_destroy(&ready_barrier);
         return 2;
     }
 
@@ -298,7 +364,9 @@ int main(int argc, char **argv)
             count++;
         }
         workers[i].config = &config;
-        workers[i].barrier = &barrier;
+        workers[i].ready_barrier = &ready_barrier;
+        workers[i].start_barrier = &start_barrier;
+        workers[i].started_us = &started;
         workers[i].start = cursor;
         workers[i].count = count;
         workers[i].warmup_count = config.warmup_requests / config.concurrency;
@@ -306,15 +374,23 @@ int main(int argc, char **argv)
             workers[i].warmup_count++;
         }
         workers[i].latencies_us = latencies;
+        workers[i].connect_us = connect_us;
+        workers[i].appconnect_us = appconnect_us;
+        workers[i].starttransfer_us = starttransfer_us;
+        workers[i].total_time_us = total_time_us;
+        workers[i].body_transfer_us = body_transfer_us;
         cursor += count;
         pthread_create(&threads[i], NULL, run_worker, &workers[i]);
     }
-    pthread_barrier_wait(&barrier);
-    uint64_t started = now_us();
+    pthread_barrier_wait(&ready_barrier);
+    started = now_us();
+    pthread_barrier_wait(&start_barrier);
 
     size_t errors = 0;
     uint64_t bytes = 0;
     uint64_t body_reads = 0;
+    uint64_t worker_start_delay_us_min = 0;
+    uint64_t worker_start_delay_us_max = 0;
     uint64_t worker_elapsed_us_min = 0;
     uint64_t worker_elapsed_us_max = 0;
     for (size_t i = 0; i < config.concurrency; i++) {
@@ -322,6 +398,13 @@ int main(int argc, char **argv)
         errors += workers[i].errors;
         bytes += workers[i].bytes;
         body_reads += workers[i].body_reads;
+        if (worker_start_delay_us_min == 0 ||
+            workers[i].start_delay_us < worker_start_delay_us_min) {
+            worker_start_delay_us_min = workers[i].start_delay_us;
+        }
+        if (workers[i].start_delay_us > worker_start_delay_us_max) {
+            worker_start_delay_us_max = workers[i].start_delay_us;
+        }
         if (workers[i].elapsed_us != 0 &&
             (worker_elapsed_us_min == 0 || workers[i].elapsed_us < worker_elapsed_us_min)) {
             worker_elapsed_us_min = workers[i].elapsed_us;
@@ -335,12 +418,27 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < config.concurrency; i++) {
         memmove(&latencies[compact], &latencies[workers[i].start],
                 workers[i].completed * sizeof(uint64_t));
+        memmove(&connect_us[compact], &connect_us[workers[i].start],
+                workers[i].completed * sizeof(uint64_t));
+        memmove(&appconnect_us[compact], &appconnect_us[workers[i].start],
+                workers[i].completed * sizeof(uint64_t));
+        memmove(&starttransfer_us[compact], &starttransfer_us[workers[i].start],
+                workers[i].completed * sizeof(uint64_t));
+        memmove(&total_time_us[compact], &total_time_us[workers[i].start],
+                workers[i].completed * sizeof(uint64_t));
+        memmove(&body_transfer_us[compact], &body_transfer_us[workers[i].start],
+                workers[i].completed * sizeof(uint64_t));
         compact += workers[i].completed;
     }
     size_t completed = compact;
 
     if (completed > 0) {
         qsort(latencies, completed, sizeof(uint64_t), cmp_u64);
+        qsort(connect_us, completed, sizeof(uint64_t), cmp_u64);
+        qsort(appconnect_us, completed, sizeof(uint64_t), cmp_u64);
+        qsort(starttransfer_us, completed, sizeof(uint64_t), cmp_u64);
+        qsort(total_time_us, completed, sizeof(uint64_t), cmp_u64);
+        qsort(body_transfer_us, completed, sizeof(uint64_t), cmp_u64);
     }
 
     double elapsed_ms = (double)elapsed_us / 1000.0;
@@ -353,8 +451,16 @@ int main(int argc, char **argv)
            "\"body_reads\":%llu,\"avg_body_read_size\":%.3f,"
            "\"elapsed_ms\":%.3f,\"rps\":%.3f,\"latency_us_p50\":%llu,"
            "\"latency_us_p90\":%llu,\"latency_us_p95\":%llu,\"latency_us_p99\":%llu,"
+           "\"connect_us_p50\":%llu,\"connect_us_p90\":%llu,\"connect_us_p99\":%llu,"
+           "\"appconnect_us_p50\":%llu,\"appconnect_us_p90\":%llu,\"appconnect_us_p99\":%llu,"
+           "\"starttransfer_us_p50\":%llu,\"starttransfer_us_p90\":%llu,"
+           "\"starttransfer_us_p99\":%llu,\"total_time_us_p50\":%llu,"
+           "\"total_time_us_p90\":%llu,\"total_time_us_p99\":%llu,"
+           "\"body_transfer_us_p50\":%llu,\"body_transfer_us_p90\":%llu,"
+           "\"body_transfer_us_p99\":%llu,"
+           "\"worker_start_delay_us_min\":%llu,\"worker_start_delay_us_max\":%llu,"
            "\"worker_elapsed_us_min\":%llu,\"worker_elapsed_us_max\":%llu}\n",
-           config.url, config.proxy, config.method, config.body_size, config.requests,
+           config.url, config.proxy == NULL ? "" : config.proxy, config.method, config.body_size, config.requests,
            config.warmup_requests, completed, errors, config.concurrency,
            config.runtime_threads, config.read_buffer_size, (unsigned long long)bytes,
            (unsigned long long)body_reads,
@@ -363,11 +469,34 @@ int main(int argc, char **argv)
            (unsigned long long)percentile(latencies, completed, 90),
            (unsigned long long)percentile(latencies, completed, 95),
            (unsigned long long)percentile(latencies, completed, 99),
+           (unsigned long long)percentile(connect_us, completed, 50),
+           (unsigned long long)percentile(connect_us, completed, 90),
+           (unsigned long long)percentile(connect_us, completed, 99),
+           (unsigned long long)percentile(appconnect_us, completed, 50),
+           (unsigned long long)percentile(appconnect_us, completed, 90),
+           (unsigned long long)percentile(appconnect_us, completed, 99),
+           (unsigned long long)percentile(starttransfer_us, completed, 50),
+           (unsigned long long)percentile(starttransfer_us, completed, 90),
+           (unsigned long long)percentile(starttransfer_us, completed, 99),
+           (unsigned long long)percentile(total_time_us, completed, 50),
+           (unsigned long long)percentile(total_time_us, completed, 90),
+           (unsigned long long)percentile(total_time_us, completed, 99),
+           (unsigned long long)percentile(body_transfer_us, completed, 50),
+           (unsigned long long)percentile(body_transfer_us, completed, 90),
+           (unsigned long long)percentile(body_transfer_us, completed, 99),
+           (unsigned long long)worker_start_delay_us_min,
+           (unsigned long long)worker_start_delay_us_max,
            (unsigned long long)worker_elapsed_us_min,
            (unsigned long long)worker_elapsed_us_max);
 
     curl_global_cleanup();
-    pthread_barrier_destroy(&barrier);
+    pthread_barrier_destroy(&ready_barrier);
+    pthread_barrier_destroy(&start_barrier);
+    free(body_transfer_us);
+    free(total_time_us);
+    free(starttransfer_us);
+    free(appconnect_us);
+    free(connect_us);
     free(latencies);
     free(workers);
     free(threads);

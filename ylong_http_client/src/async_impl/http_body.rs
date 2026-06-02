@@ -15,10 +15,8 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::future::Future;
 use std::io::{Cursor, Read};
-use std::sync::Arc;
 
 use ylong_http::body::async_impl::Body;
-use ylong_http::body::TextBodyDecoder;
 #[cfg(feature = "http1_1")]
 use ylong_http::body::{ChunkBodyDecoder, ChunkState};
 use ylong_http::headers::Headers;
@@ -27,7 +25,7 @@ use super::conn::StreamData;
 use crate::error::{ErrorKind, HttpClientError};
 use crate::runtime::{AsyncRead, ReadBuf, Sleep};
 use crate::util::config::HttpVersion;
-use crate::util::interceptor::Interceptors;
+use crate::util::interceptor::InterceptorContext;
 use crate::util::normalizer::BodyLength;
 
 const TRAILER_SIZE: usize = 1024;
@@ -74,7 +72,7 @@ type BoxStreamData = Box<dyn StreamData + Sync + Send + Unpin>;
 
 impl HttpBody {
     pub(crate) fn new(
-        interceptors: Arc<Interceptors>,
+        interceptors: InterceptorContext,
         body_length: BodyLength,
         io: BoxStreamData,
         pre: &[u8],
@@ -211,13 +209,13 @@ enum Kind {
 }
 
 struct UntilClose {
-    interceptors: Arc<Interceptors>,
+    interceptors: InterceptorContext,
     pre: Option<Cursor<Vec<u8>>>,
     io: Option<BoxStreamData>,
 }
 
 impl UntilClose {
-    pub(crate) fn new(pre: &[u8], io: BoxStreamData, interceptors: Arc<Interceptors>) -> Self {
+    pub(crate) fn new(pre: &[u8], io: BoxStreamData, interceptors: InterceptorContext) -> Self {
         Self {
             interceptors,
             pre: (!pre.is_empty()).then_some(Cursor::new(pre.to_vec())),
@@ -304,8 +302,8 @@ impl UntilClose {
 }
 
 struct Text {
-    interceptors: Arc<Interceptors>,
-    decoder: TextBodyDecoder,
+    interceptors: InterceptorContext,
+    remaining: u64,
     pre: Option<Cursor<Vec<u8>>>,
     io: Option<BoxStreamData>,
 }
@@ -315,11 +313,11 @@ impl Text {
         len: u64,
         pre: &[u8],
         io: BoxStreamData,
-        interceptors: Arc<Interceptors>,
+        interceptors: InterceptorContext,
     ) -> Self {
         Self {
             interceptors,
-            decoder: TextBodyDecoder::new(len),
+            remaining: len,
             pre: (!pre.is_empty()).then_some(Cursor::new(pre.to_vec())),
             io: Some(io),
         }
@@ -345,7 +343,7 @@ impl Text {
                 self.pre = None;
             } else {
                 read += this_read;
-                if let Some(result) = self.read_remaining(buf, read) {
+                if let Some(result) = self.read_remaining(read) {
                     return result;
                 }
             }
@@ -359,22 +357,9 @@ impl Text {
         Poll::Ready(Ok(read))
     }
 
-    fn read_remaining(
-        &mut self,
-        buf: &mut [u8],
-        read: usize,
-    ) -> Option<Poll<Result<usize, HttpClientError>>> {
-        let (text, rem) = self.decoder.decode(&buf[..read]);
-
-        // Contains redundant `rem`, return error.
-        match (text.is_complete(), rem.is_empty()) {
-            (true, false) => {
-                if let Some(io) = self.io.take() {
-                    io.shutdown();
-                };
-                Some(Poll::Ready(err_from_msg!(BodyDecode, "Not eof")))
-            }
-            (true, true) => {
+    fn read_remaining(&mut self, read: usize) -> Option<Poll<Result<usize, HttpClientError>>> {
+        match self.consume(read) {
+            Ok(true) => {
                 if let Some(io) = self.io.take() {
                     // stream not closed, waiting for the fin
                     if !io.is_stream_closable() {
@@ -383,9 +368,23 @@ impl Text {
                 }
                 Some(Poll::Ready(Ok(read)))
             }
-            // TextBodyDecoder decodes as much as possible here.
-            _ => None,
+            Ok(false) => None,
+            Err(e) => {
+                if let Some(io) = self.io.take() {
+                    io.shutdown();
+                };
+                Some(Poll::Ready(Err(e)))
+            }
         }
+    }
+
+    fn consume(&mut self, filled: usize) -> Result<bool, HttpClientError> {
+        if filled as u64 > self.remaining {
+            self.remaining = 0;
+            return err_from_msg!(BodyDecode, "Not eof");
+        }
+        self.remaining -= filled as u64;
+        Ok(self.remaining == 0)
     }
 
     fn poll_read_io(
@@ -409,30 +408,27 @@ impl Text {
                     let filled = read_buf.filled().len();
                     if filled == 0 {
                         // stream closed, and get the fin
-                        if io.is_stream_closable() && self.decoder.decode(&buf[..0]).0.is_complete()
-                        {
+                        if io.is_stream_closable() && self.remaining == 0 {
                             return Poll::Ready(Ok(read));
                         }
                         io.shutdown();
                         return Poll::Ready(err_from_msg!(BodyDecode, "Response body incomplete"));
                     }
-                    let (text, rem) = self.decoder.decode(read_buf.filled());
                     self.interceptors.intercept_output(read_buf.filled())?;
                     read += filled;
-                    // Contains redundant `rem`, return error.
-                    match (text.is_complete(), rem.is_empty()) {
-                        (true, false) => {
-                            io.shutdown();
-                            return Poll::Ready(err_from_msg!(BodyDecode, "Not eof"));
-                        }
-                        (true, true) => {
+                    match self.consume(filled) {
+                        Ok(true) => {
                             if !io.is_stream_closable() {
                                 // stream not closed, waiting for the fin
                                 self.io = Some(io);
                             }
                             return Poll::Ready(Ok(read));
                         }
-                        _ => {}
+                        Ok(false) => {}
+                        Err(e) => {
+                            io.shutdown();
+                            return Poll::Ready(Err(e));
+                        }
                     }
                 }
                 Poll::Pending => {
@@ -456,7 +452,7 @@ impl Text {
 
 #[cfg(feature = "http1_1")]
 struct Chunk {
-    interceptors: Arc<Interceptors>,
+    interceptors: InterceptorContext,
     decoder: ChunkBodyDecoder,
     pre: Option<Cursor<Vec<u8>>>,
     io: Option<BoxStreamData>,
@@ -464,7 +460,7 @@ struct Chunk {
 
 #[cfg(feature = "http1_1")]
 impl Chunk {
-    pub(crate) fn new(pre: &[u8], io: BoxStreamData, interceptors: Arc<Interceptors>) -> Self {
+    pub(crate) fn new(pre: &[u8], io: BoxStreamData, interceptors: InterceptorContext) -> Self {
         Self {
             interceptors,
             decoder: ChunkBodyDecoder::new().contains_trailer(true),
@@ -604,12 +600,10 @@ impl Chunk {
 #[cfg(feature = "ylong_base")]
 #[cfg(test)]
 mod ut_async_http_body {
-    use std::sync::Arc;
-
     use ylong_http::body::async_impl;
 
     use crate::async_impl::HttpBody;
-    use crate::util::interceptor::IdleInterceptor;
+    use crate::util::interceptor::InterceptorContext;
     use crate::util::normalizer::BodyLength;
     use crate::ErrorKind;
 
@@ -639,7 +633,7 @@ mod ut_async_http_body {
             accept:text/html\r\n\r\n\
             ";
         let mut chunk = HttpBody::new(
-            Arc::new(IdleInterceptor),
+            InterceptorContext::none(),
             BodyLength::Chunk,
             box_stream,
             chunk_body_bytes.as_bytes(),
@@ -663,7 +657,7 @@ mod ut_async_http_body {
             ";
 
         let mut chunk = HttpBody::new(
-            Arc::new(IdleInterceptor),
+            InterceptorContext::none(),
             BodyLength::Chunk,
             box_stream,
             chunk_body_no_trailer_bytes.as_bytes(),
@@ -697,7 +691,7 @@ mod ut_async_http_body {
             Expires: Wed, 21 Oct 2015 07:27:00 GMT \r\n\r\n\
             ";
         let mut chunk = HttpBody::new(
-            Arc::new(IdleInterceptor),
+            InterceptorContext::none(),
             BodyLength::Chunk,
             box_stream,
             chunk_body_bytes.as_bytes(),
@@ -741,7 +735,7 @@ mod ut_async_http_body {
         );
         let chunk_body_bytes = "";
         let mut chunk = HttpBody::new(
-            Arc::new(IdleInterceptor),
+            InterceptorContext::none(),
             BodyLength::Chunk,
             box_stream,
             chunk_body_bytes.as_bytes(),
@@ -763,7 +757,7 @@ mod ut_async_http_body {
             ";
 
         let mut chunk = HttpBody::new(
-            Arc::new(IdleInterceptor),
+            InterceptorContext::none(),
             BodyLength::Chunk,
             box_stream,
             chunk_body_no_trailer_bytes.as_bytes(),
@@ -797,7 +791,7 @@ mod ut_async_http_body {
         let content_bytes = "hello";
 
         match HttpBody::new(
-            Arc::new(IdleInterceptor),
+            InterceptorContext::none(),
             BodyLength::Empty,
             box_stream,
             content_bytes.as_bytes(),
@@ -826,7 +820,7 @@ mod ut_async_http_body {
         let content_bytes = "";
 
         let mut text = HttpBody::new(
-            Arc::new(IdleInterceptor),
+            InterceptorContext::none(),
             BodyLength::Length(11),
             box_stream,
             content_bytes.as_bytes(),
@@ -848,7 +842,7 @@ mod ut_async_http_body {
         let content_bytes = "hello";
 
         let mut text = HttpBody::new(
-            Arc::new(IdleInterceptor),
+            InterceptorContext::none(),
             BodyLength::Length(5),
             box_stream,
             content_bytes.as_bytes(),
@@ -861,6 +855,39 @@ mod ut_async_http_body {
         assert_eq!(read, 5);
         let read = async_impl::Body::data(&mut text, &mut buf).await.unwrap();
         assert_eq!(read, 0);
+
+        let box_stream = Box::new("".as_bytes());
+        let content_bytes = "hello!";
+        let mut text = HttpBody::new(
+            InterceptorContext::none(),
+            BodyLength::Length(5),
+            box_stream,
+            content_bytes.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            async_impl::Body::data(&mut text, &mut buf)
+                .await
+                .unwrap_err()
+                .error_kind(),
+            ErrorKind::BodyDecode
+        );
+
+        let box_stream = Box::new("hello!".as_bytes());
+        let mut text = HttpBody::new(
+            InterceptorContext::none(),
+            BodyLength::Length(5),
+            box_stream,
+            "".as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            async_impl::Body::data(&mut text, &mut buf)
+                .await
+                .unwrap_err()
+                .error_kind(),
+            ErrorKind::BodyDecode
+        );
     }
 
     /// UT test cases for until_close `HttpBody::new`.
@@ -882,7 +909,7 @@ mod ut_async_http_body {
         let content_bytes = "";
 
         let mut until_close = HttpBody::new(
-            Arc::new(IdleInterceptor),
+            InterceptorContext::none(),
             BodyLength::UntilClose,
             box_stream,
             content_bytes.as_bytes(),
@@ -908,7 +935,7 @@ mod ut_async_http_body {
         let content_bytes = "hello";
 
         let mut until_close = HttpBody::new(
-            Arc::new(IdleInterceptor),
+            InterceptorContext::none(),
             BodyLength::UntilClose,
             box_stream,
             content_bytes.as_bytes(),

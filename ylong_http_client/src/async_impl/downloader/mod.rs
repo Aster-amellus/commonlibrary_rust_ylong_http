@@ -253,15 +253,13 @@ impl Default for DownloadConfig {
 
 #[cfg(all(test, feature = "ylong_base"))]
 mod ut_downloader {
-    use std::sync::Arc;
-
     use ylong_http::h1::ResponseDecoder;
     use ylong_http::response::Response;
 
     use crate::async_impl::conn::StreamData;
     use crate::async_impl::{Downloader, HttpBody, Response as adpater_resp};
     use crate::util::config::HttpVersion;
-    use crate::util::interceptor::IdleInterceptor;
+    use crate::util::interceptor::InterceptorContext;
     use crate::util::normalizer::BodyLength;
 
     impl StreamData for &[u8] {
@@ -304,7 +302,7 @@ mod ut_downloader {
             \r\n\
             ";
         let chunk = HttpBody::new(
-            Arc::new(IdleInterceptor),
+            InterceptorContext::none(),
             BodyLength::Chunk,
             box_stream,
             chunk_body_bytes.as_bytes(),

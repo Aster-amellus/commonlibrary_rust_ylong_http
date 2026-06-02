@@ -16,11 +16,103 @@
 #[cfg(feature = "async")]
 use ylong_http::response::Response as HttpResp;
 
+use std::sync::Arc;
+
 #[cfg(feature = "async")]
 use crate::async_impl::{HttpBody, Request, Response};
 use crate::{ConnDetail, HttpClientError};
 
 pub(crate) type Interceptors = dyn Interceptor + Sync + Send + 'static;
+
+/// Optional interceptor wrapper.
+///
+/// The default client has no installed interceptor, so hot paths can skip
+/// no-op dynamic dispatch. User-provided interceptors keep the same behavior.
+#[derive(Clone, Default)]
+pub(crate) struct InterceptorContext {
+    inner: Option<Arc<Interceptors>>,
+}
+
+impl InterceptorContext {
+    pub(crate) fn none() -> Self {
+        Self { inner: None }
+    }
+
+    pub(crate) fn new<T>(interceptor: T) -> Self
+    where
+        T: Interceptor + Sync + Send + 'static,
+    {
+        Self {
+            inner: Some(Arc::new(interceptor)),
+        }
+    }
+
+    pub(crate) fn intercept_connection(&self, info: ConnDetail) -> Result<(), HttpClientError> {
+        if let Some(interceptor) = &self.inner {
+            interceptor.intercept_connection(info)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn intercept_input(&self, bytes: &[u8]) -> Result<(), HttpClientError> {
+        if let Some(interceptor) = &self.inner {
+            interceptor.intercept_input(bytes)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn intercept_output(&self, bytes: &[u8]) -> Result<(), HttpClientError> {
+        if let Some(interceptor) = &self.inner {
+            interceptor.intercept_output(bytes)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn intercept_request(&self, request: &Request) -> Result<(), HttpClientError> {
+        if let Some(interceptor) = &self.inner {
+            interceptor.intercept_request(request)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn intercept_response(&self, response: &Response) -> Result<(), HttpClientError> {
+        if let Some(interceptor) = &self.inner {
+            interceptor.intercept_response(response)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn intercept_retry(&self, error: &HttpClientError) -> Result<(), HttpClientError> {
+        if let Some(interceptor) = &self.inner {
+            interceptor.intercept_retry(error)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn intercept_redirect_request(
+        &self,
+        request: &Request,
+    ) -> Result<(), HttpClientError> {
+        if let Some(interceptor) = &self.inner {
+            interceptor.intercept_redirect_request(request)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn intercept_redirect_response(
+        &self,
+        response: &HttpResp<HttpBody>,
+    ) -> Result<(), HttpClientError> {
+        if let Some(interceptor) = &self.inner {
+            interceptor.intercept_redirect_response(response)?;
+        }
+        Ok(())
+    }
+}
 
 /// Transport layer protocol type.
 #[derive(Clone)]
@@ -88,8 +180,3 @@ pub trait Interceptor {
         Ok(())
     }
 }
-
-/// The default Interceptor does not do any intercepting.
-pub(crate) struct IdleInterceptor;
-
-impl Interceptor for IdleInterceptor {}
