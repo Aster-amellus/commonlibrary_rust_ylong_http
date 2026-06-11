@@ -2298,3 +2298,19 @@ trace-summary 仍显示 `request_pending_gap_p99_us=36610`、`request_pending_ga
 - `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
 
 结论：保留该改动作为通用 request hot-path cleanup；它有小幅 strict 信号，但仍不是 20%+ completion path。后续不要继续沿 request construction/URI formatting 假设追主目标，除非有 profiler 证明 CPU allocation 已成为新瓶颈。
+
+补充 HTTP/1 pool round-robin scan 负实验：为验证 shared pool 复用阶段是否因 `exist_h1_conn()` 每次从 newest dispatcher 倒扫并全量 `retain` shutdown entries 而形成锁内热点，本轮临时把 HTTP/1 dispatcher list 改成带 cursor 的 round-robin scan，并将 shutdown pruning 移到周期/未命中路径；同时加单测确认 cursor 轮转。该改动已撤回。
+
+同一 native HTTPS-over-HTTPS-proxy fixture，`requests=128`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`read_buffer_size=64 KiB`、`--phase-summary`：
+
+| Client experiment | repeats | ylong avg rps | libcurl avg rps | 平均提升 | passes | formal_pass | ylong p99 avg | libcurl p99 avg |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| HTTP/1 pool round-robin scan + deferred shutdown prune | 3 | 2779.368 | 2714.919 | +2.120% | 0/3 | false | 38.285ms | 32.336ms |
+
+验证：
+
+- `cargo test -p ylong_http_client ut_dispatch_rotates_reuse_start --features "async http1_1 ylong_base"` passed while the temporary patch was active.
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"` passed while the temporary patch was active.
+- `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed while the temporary patch was active.
+
+诊断价值：round-robin scan did not improve strict CONNECT; p99 regressed and one paired sample was negative. The fixed newest-first reuse pattern is likely preserving useful connection/cache locality, and the lock/list cleanup cost is not the dominant tail source at this workload. Do not reintroduce H1 pool cursoring as a primary completion path without fresh profiler evidence.
