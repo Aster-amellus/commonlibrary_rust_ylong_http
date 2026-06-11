@@ -2258,3 +2258,24 @@ smoke 验证：
 - `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"` passed with existing warnings while the temporary timing removal was active.
 
 诊断价值：HTTP/1 request-phase timestamp overhead is not the missing +20% lever. A short phase run still stayed below target and the stricter 512-request no-phase run was effectively flat (+0.253%) with worse ylong p99 than libcurl. Because `Response::time_group()` is public timing metadata and the probe does not produce a stable throughput win, there is no basis to add an API-level timing opt-out or remove these timestamps for normal clients.
+
+补充 HTTP/1 pool permit fast path：为减少热连接复用路径上不必要的 async semaphore future 构造/轮询，本轮在 HTTP/1 connection pool 获取容量许可时先调用 `try_acquire()`，只有容量已满时才进入原来的 `acquire().await`。该改动保留“先预留容量、再扫描 dispatcher list”的顺序，避免并发任务同时复用同一个 idle-capacity slot 后突破 `max_conn_num`。
+
+同一 native HTTPS-over-HTTPS-proxy fixture 下的短复测：
+
+| Client experiment | requests | warmup | concurrency | runtime threads | repeats | ylong avg rps | libcurl avg rps | 平均提升 | passes | formal_pass | ylong p99 avg | libcurl p99 avg |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| HTTP/1 permit `try_acquire` fast path | 64 | 16 | 16 | 8 | 3 | 3184.992 | 2871.110 | +11.159% | 0/3 | false | 7.984ms | 9.201ms |
+| HTTP/1 permit `try_acquire` fast path | 128 | 64 | 64 | 16 | 3 | 2686.313 | 2679.302 | +0.224% | 0/3 | false | 40.659ms | 34.131ms |
+
+同一 strict 点追加 `--trace-summary` 单轮显示 ylong `2921.002 rps`、libcurl `2876.211 rps`、`+1.557%`，但 `request_pending_gap_p99_us=34905`、`request_pending_gap_max_us=35888`，且 migrated pending-gap samples 仍占主导。这说明该 fast path 能减少无竞争 pool 许可路径开销，在低并发短测中有正向信号；但 strict 64 并发 1 MiB CONNECT 的剩余缺口仍来自 request future 从 Pending 到下一次 poll 的 runtime scheduling tail，而不是 HTTP/1 pool semaphore future 本身。
+
+验证：
+
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+- `cargo test -p ylong_http_client ut_try_acquire_respects_capacity_and_releases_on_drop --features "async http1_1 ylong_base"` passed with existing warnings.
+- `cargo test -p ylong_http_client ut_try_acquire_respects_capacity_and_releases_on_drop --features "async http1_1 tokio_base"` passed with existing warnings.
+- The same targeted test with `c_openssl_3_0` enabled was not usable as a validation gate because existing crate-test binaries fail to link raw OpenSSL C symbols; the TLS benchmark examples above still build and link successfully.
+
+结论：保留该改动作为低风险 HTTP/1 hot-pool 微优化和容量许可语义测试，但它不是 strict CONNECT +20% completion path。后续主线仍应集中在 I/O-ready request task 恢复尾部、worker migration/fairness，或更系统的大响应 transfer 调度机制。

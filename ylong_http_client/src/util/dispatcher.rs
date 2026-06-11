@@ -275,6 +275,24 @@ pub(crate) mod http1 {
             }
         }
 
+        pub(crate) fn try_acquire(&self) -> Option<WrappedSemPermit> {
+            #[cfg(feature = "ylong_base")]
+            {
+                self.sem.try_acquire().ok().map(|_| WrappedSemPermit {
+                    sem: self.sem.clone(),
+                })
+            }
+
+            #[cfg(feature = "tokio_base")]
+            {
+                self.sem
+                    .clone()
+                    .try_acquire_owned()
+                    .ok()
+                    .map(|permit| WrappedSemPermit { permit })
+            }
+        }
+
         pub(crate) async fn acquire(&self) -> WrappedSemPermit {
             #[cfg(feature = "ylong_base")]
             {
@@ -311,6 +329,23 @@ pub(crate) mod http1 {
     impl Drop for WrappedSemPermit {
         fn drop(&mut self) {
             self.sem.release();
+        }
+    }
+
+    #[cfg(test)]
+    mod ut_wrapped_semaphore {
+        use super::WrappedSemaphore;
+
+        #[test]
+        fn ut_try_acquire_respects_capacity_and_releases_on_drop() {
+            let sem = WrappedSemaphore::new(1);
+
+            let permit = sem.try_acquire();
+            assert!(permit.is_some());
+            assert!(sem.try_acquire().is_none());
+
+            drop(permit);
+            assert!(sem.try_acquire().is_some());
         }
     }
 }

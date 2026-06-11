@@ -195,7 +195,7 @@ impl<S: AsyncRead + AsyncWrite + ConnInfo + Unpin + Send + Sync + 'static> Conns
     where
         C: Connector<Stream = S>,
     {
-        let semaphore = self.usable.acquire().await;
+        let semaphore = self.acquire_h1_permit().await;
         match self.exist_h1_conn(semaphore) {
             H1ConnOption::Some(conn) => Ok(TimeInfoConn::new(conn, TimeGroup::default())),
             H1ConnOption::None(permit) => {
@@ -292,7 +292,7 @@ impl<S: AsyncRead + AsyncWrite + ConnInfo + Unpin + Send + Sync + 'static> Conns
                 if let Some(conn) = self.exist_h2_conn(&mut lock) {
                     return Ok(TimeInfoConn::new(conn, TimeGroup::default()));
                 }
-                let permit = self.usable.acquire().await;
+                let permit = self.acquire_h1_permit().await;
                 let permit = match self.exist_h1_conn(permit) {
                     H1ConnOption::Some(conn) => {
                         return Ok(TimeInfoConn::new(conn, TimeGroup::default()));
@@ -373,6 +373,15 @@ impl<S: AsyncRead + AsyncWrite + ConnInfo + Unpin + Send + Sync + 'static> Conns
             }
         }
         None
+    }
+
+    async fn acquire_h1_permit(&self) -> WrappedSemPermit {
+        // Reserve capacity before scanning the dispatcher list. Dispatching first would let
+        // another task consume the same idle-capacity slot and could exceed max_conn_num.
+        match self.usable.try_acquire() {
+            Some(permit) => permit,
+            None => self.usable.acquire().await,
+        }
     }
 
     fn dispatch_h1_conn(&self, dispatcher: ConnDispatcher<S>, permit: WrappedSemPermit) -> Conn<S> {
