@@ -63,6 +63,10 @@ impl UriFormatter {
     }
 
     pub(crate) fn format(&self, uri: &mut Uri) -> Result<(), HttpClientError> {
+        if uri_already_normalized(uri) {
+            return Ok(());
+        }
+
         let host = match uri.host() {
             Some(host) => host.clone(),
             None => return err_from_msg!(Request, "No host in url"),
@@ -110,6 +114,17 @@ impl UriFormatter {
 
         Ok(())
     }
+}
+
+fn uri_already_normalized(uri: &Uri) -> bool {
+    // The slow path below rebuilds the URI only to fill in defaults. If all
+    // normalized fields are already present, keep the existing allocation.
+    let has_valid_port = match uri.port() {
+        Some(port) => port.as_u16().is_ok(),
+        None => false,
+    };
+
+    uri.scheme().is_some() && uri.host().is_some() && has_valid_port && uri.path().is_some()
 }
 
 pub(crate) struct BodyLengthParser<'a> {
@@ -240,6 +255,22 @@ mod ut_normalizer {
         let mut uri = Uri::from_bytes(b"http://example.com").unwrap();
         let uni = UriFormatter::new();
         let _ = uni.format(&mut uri);
+        assert_eq!(uri.path().unwrap().as_str(), "/");
+    }
+
+    #[test]
+    fn ut_uri_format_keeps_already_normalized_uri() {
+        let mut uri = Uri::from_bytes(b"https://127.0.0.1:38081/").unwrap();
+
+        let formatter = UriFormatter::new();
+        formatter.format(&mut uri).unwrap();
+
+        assert_eq!(
+            uri.scheme().unwrap(),
+            &ylong_http::request::uri::Scheme::HTTPS
+        );
+        assert_eq!(uri.host().unwrap().as_str(), "127.0.0.1");
+        assert_eq!(uri.port().unwrap().as_u16().unwrap(), 38081);
         assert_eq!(uri.path().unwrap().as_str(), "/");
     }
 

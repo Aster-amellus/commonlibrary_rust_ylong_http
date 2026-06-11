@@ -2279,3 +2279,22 @@ smoke 验证：
 - The same targeted test with `c_openssl_3_0` enabled was not usable as a validation gate because existing crate-test binaries fail to link raw OpenSSL C symbols; the TLS benchmark examples above still build and link successfully.
 
 结论：保留该改动作为低风险 HTTP/1 hot-pool 微优化和容量许可语义测试，但它不是 strict CONNECT +20% completion path。后续主线仍应集中在 I/O-ready request task 恢复尾部、worker migration/fairness，或更系统的大响应 transfer 调度机制。
+
+补充 URI formatter no-op fast path：`RequestFormatter` 每个 request 都会调用 `UriFormatter::format()`；GET benchmark 已用 prebuilt requests 避开 request 构造，但 measured `client.request()` 内仍会重建已包含 scheme、host、显式 port 和 path 的 URI。本轮为这种已规范化 URI 增加 no-op fast path，避免热路径上重复 clone host、format authority 和重建 URI；缺省端口、缺 path、缺 scheme/host 或非法 port 仍走原来的规范化逻辑，行为边界不变。
+
+同一 native HTTPS-over-HTTPS-proxy fixture，`requests=128`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`read_buffer_size=64 KiB`：
+
+| Client experiment | repeats | ylong avg rps | libcurl avg rps | 平均提升 | passes | formal_pass | ylong p99 avg | libcurl p99 avg |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| normalized URI no-op fast path, phase summary | 3 | 3042.044 | 2860.906 | +6.231% | 0/3 | false | 36.184ms | 34.765ms |
+| normalized URI no-op fast path, trace summary | 1 | 2871.595 | 2728.164 | +5.257% | 0/1 | false | 38.061ms | 37.407ms |
+
+trace-summary 仍显示 `request_pending_gap_p99_us=36610`、`request_pending_gap_max_us=36916`，request pending migrated samples 为 `118`、same-thread samples 为 `9`；body pending gap p99 为 `15475us`。因此该改动只消除已规范化 request 的无效 URI 分配/格式化，不改变 strict CONNECT 的主尾延迟模型。
+
+验证：
+
+- `cargo test -p ylong_http_client ut_uri_format_keeps_already_normalized_uri --features "async http1_1 ylong_base"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+
+结论：保留该改动作为通用 request hot-path cleanup；它有小幅 strict 信号，但仍不是 20%+ completion path。后续不要继续沿 request construction/URI formatting 假设追主目标，除非有 profiler 证明 CPU allocation 已成为新瓶颈。
