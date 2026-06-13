@@ -209,6 +209,8 @@ impl TimeGroup {
     }
 
     pub(crate) fn update_transport_conn_time(&mut self, time_group: &TimeGroup) {
+        // Body transfer timestamps belong to the request path; this only copies
+        // connection and request-write phase timings from the acquired stream.
         self.update_dns_start(time_group.dns_start_time());
         self.update_dns_end(time_group.dns_end_time());
         self.update_dns_duration(time_group.dns_duration());
@@ -223,10 +225,6 @@ impl TimeGroup {
         self.update_quic_end(time_group.quic_end_time());
         #[cfg(feature = "http3")]
         self.update_quic_duration(time_group.quic_duration());
-
-        self.update_tcp_start(time_group.tcp_start_time());
-        self.update_tcp_end(time_group.tcp_end_time());
-        self.update_tcp_duration(time_group.tcp_duration());
 
         #[cfg(feature = "__tls")]
         self.update_tls_start(time_group.tls_start_time());
@@ -357,5 +355,57 @@ impl TimeGroup {
     /// Gets the time it took to establish the requested connection.
     pub fn connect_duration(&self) -> Option<Duration> {
         self.conn_duration
+    }
+}
+
+#[cfg(test)]
+mod ut_time_group {
+    use super::*;
+
+    #[test]
+    fn ut_update_transport_conn_time_copies_connection_fields_only() {
+        let base = Instant::now();
+        let mut src = TimeGroup::default();
+
+        src.set_dns_start(base);
+        src.set_dns_end(base + Duration::from_millis(1));
+        src.set_tcp_start(base + Duration::from_millis(2));
+        src.set_tcp_end(base + Duration::from_millis(5));
+        #[cfg(feature = "__tls")]
+        {
+            src.set_tls_start(base + Duration::from_millis(6));
+            src.set_tls_end(base + Duration::from_millis(9));
+        }
+        src.set_connect_start(base + Duration::from_millis(10));
+        src.set_connect_end(base + Duration::from_millis(15));
+        src.set_transfer_start(base + Duration::from_millis(20));
+        src.set_request_write_end(base + Duration::from_millis(23));
+        src.set_transfer_end(base + Duration::from_millis(31));
+
+        let mut dst = TimeGroup::default();
+        dst.update_transport_conn_time(&src);
+
+        assert_eq!(dst.dns_start_time(), src.dns_start_time());
+        assert_eq!(dst.dns_end_time(), src.dns_end_time());
+        assert_eq!(dst.dns_duration(), Some(Duration::from_millis(1)));
+        assert_eq!(dst.tcp_start_time(), src.tcp_start_time());
+        assert_eq!(dst.tcp_end_time(), src.tcp_end_time());
+        assert_eq!(dst.tcp_duration(), Some(Duration::from_millis(3)));
+        #[cfg(feature = "__tls")]
+        {
+            assert_eq!(dst.tls_start_time(), src.tls_start_time());
+            assert_eq!(dst.tls_end_time(), src.tls_end_time());
+            assert_eq!(dst.tls_duration(), Some(Duration::from_millis(3)));
+        }
+        assert_eq!(dst.connect_start_time(), src.connect_start_time());
+        assert_eq!(dst.connect_end_time(), src.connect_end_time());
+        assert_eq!(dst.connect_duration(), Some(Duration::from_millis(5)));
+        assert_eq!(dst.request_write_end_time(), src.request_write_end_time());
+        assert_eq!(dst.request_write_duration(), Some(Duration::from_millis(3)));
+        assert_eq!(dst.response_wait_duration(), Some(Duration::from_millis(8)));
+
+        assert_eq!(dst.transfer_start_time(), None);
+        assert_eq!(dst.transfer_end_time(), None);
+        assert_eq!(dst.transfer_duration(), None);
     }
 }
