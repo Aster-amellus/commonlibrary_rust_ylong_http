@@ -2427,3 +2427,23 @@ trace-summary 仍显示 `request_pending_gap_p99_us=36610`、`request_pending_ga
 - `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings while the temporary patch was active.
 
 诊断价值：status line 已不是 strict CONNECT 的有效优化面；更细粒度的 fixed-prefix 判断反而增加热路径分支/比较成本，并放大 p99 弱势。除非 profiler 明确显示 parser 空格扫描重新成为热点，否则不要再沿 status-line prefix 方向追主目标。
+
+补充 async response/body inline hints 负实验：本轮临时给 `ylong_http::async_impl::Body::data`、`DataFuture::poll`、`ylong_http_client::async_impl::Response::data` 以及 `HttpBody` / `Text` 的 body read helper 增加 `#[inline]`，目的是测试跨 crate async body 热路径是否被函数边界影响。该改动不改变语义，且 body 单测和 benchmark 示例构建均通过；但 strict 复测只有小幅平均吞吐信号，paired pass 为 0，p99 仍弱于 libcurl，因此该源码改动已撤回。
+
+同一 native HTTPS-over-HTTPS-proxy fixture，`requests=128`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`read_buffer_size=64 KiB`、`--phase-summary`：
+
+| Client experiment | repeats | ylong avg rps | libcurl avg rps | 平均提升 | passes | formal_pass | ylong p99 avg | libcurl p99 avg | max/min 提升 | 日志 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| async response/body inline hints | 3 | 2909.897 | 2791.084 | +4.051% | 0/3 | false | 38.566ms | 33.142ms | +11.998% / -4.634% | `target/https_proxy_bench/strict_body_inline_repeat3.log` |
+
+验证：
+
+- `cargo test -p ylong_http_client --features "async http1_1 ylong_base" http_body -- --nocapture` passed: 5 client body tests while the temporary patch was active.
+- `cargo test -p ylong_http --features "http1_1 ylong_base" ut_asyn_body_mut_asyn_body_data -- --nocapture` passed: 1 core async body test while the temporary patch was active.
+- `rustfmt --check ylong_http/src/body/mod.rs ylong_http_client/src/async_impl/response.rs ylong_http_client/src/async_impl/http_body.rs` passed with existing rustfmt-config warnings while the temporary patch was active.
+- `git diff --check` passed while the temporary patch was active.
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"` passed with existing warnings while the temporary patch was active.
+- `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed with existing warnings while the temporary patch was active.
+- `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings while the temporary patch was active.
+
+诊断价值：simple cross-crate inline hints are not enough to close the strict CONNECT gap. The remaining gap still points to async I/O wake / task resume tail rather than ordinary response body helper call overhead. Do not reintroduce broad inline annotations on this path unless fresh profiler evidence shows call-boundary overhead after larger scheduler/I/O changes.
