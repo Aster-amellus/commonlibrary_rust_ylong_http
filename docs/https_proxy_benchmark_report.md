@@ -2389,3 +2389,22 @@ trace-summary 仍显示 `request_pending_gap_p99_us=36610`、`request_pending_ga
 - `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
 
 结论：保留该改动作为 async HTTP/1 request hot-path cleanup；它删除无行为价值的 `Content-Length` String parse，并让 empty-body 跳过路径更直接。但 strict CONNECT repeat3 仍只有 +4.602%、0/3 passes、formal_pass=false，不能作为 20%+ completion path。后续不要继续沿 empty request body encoder 判断追主目标，除非 profiler 显示 request-send CPU 开销重新成为主要瓶颈。
+
+补充 HTTP/1 response status-line borrowed fast path：`ResponseDecoder` 原先在普通单段响应里仍把 `HTTP/1.1` 和 3 字节 status code 复制到 `Vec`，再解析成 `Version` / `StatusCode`；只有真正跨 read 分段时才需要 `rest` 拼接。本轮把 version/status token 解析改成优先使用借用 slice，`rest` 非空时才走原有拼接 fallback，并保留一条注释说明单段状态行是 hot path。
+
+同一 native HTTPS-over-HTTPS-proxy fixture，`requests=128`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`read_buffer_size=64 KiB`、`--phase-summary`：
+
+| Client experiment | repeats | ylong avg rps | libcurl avg rps | 平均提升 | passes | formal_pass | ylong p99 avg | libcurl p99 avg | max/min 提升 | 日志 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| HTTP/1 response status-line borrowed fast path | 3 | 2706.350 | 2558.431 | +5.517% | 0/3 | false | 41.417ms | 36.014ms | +13.321% / -0.187% | `target/https_proxy_bench/strict_response_status_line_borrowed_repeat3.log` |
+
+验证：
+
+- `rustfmt --check ylong_http/src/h1/response/decoder.rs` passed with existing rustfmt-config warnings.
+- `git diff --check` passed.
+- `cargo test -p ylong_http --features http1_1 ut_response_decoder -- --nocapture` passed: 4 response decoder tests.
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+
+结论：保留该改动作为通用 HTTP/1 response status-line parsing cleanup；它删除普通响应中的两个小分配，跨段状态行仍保持原行为。strict CONNECT repeat3 仍只有 +5.517%、0/3 passes、formal_pass=false，p99 仍弱于 libcurl，因此它不是 20%+ completion path。后续不要继续深挖 status-line token allocation，除非 profiler 显示 response parser CPU 成为新的主瓶颈。

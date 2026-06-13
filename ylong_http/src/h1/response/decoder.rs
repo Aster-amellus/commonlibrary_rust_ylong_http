@@ -231,17 +231,8 @@ impl ResponseDecoder {
         self.stage = ParseStage::Version;
         match status_token(buffer)? {
             TokenStatus::Complete((version, unparsed)) => {
-                let version = self.take_value(version);
-                match version.as_slice() {
-                    b"HTTP/1.0" => {
-                        self.version = Some(Version::HTTP1_0);
-                    }
-                    b"HTTP/1.1" => {
-                        self.version = Some(Version::HTTP1_1);
-                    }
-                    // TODO: Support for other `HTTP` versions.
-                    _ => return Err(ErrorKind::H1(H1Error::InvalidResponse).into()),
-                }
+                let version = self.decode_version_token(version)?;
+                self.version = Some(version);
                 self.status_code_phase(unparsed)
             }
             TokenStatus::Partial(rest) => {
@@ -258,17 +249,34 @@ impl ResponseDecoder {
         self.stage = ParseStage::StatusCode;
         match status_token(buffer)? {
             TokenStatus::Complete((code, unparsed)) => {
-                let code = self.take_value(code);
-                self.status_code = Some(
-                    StatusCode::from_bytes(code.as_slice())
-                        .map_err(|_| HttpError::from(ErrorKind::H1(H1Error::InvalidResponse)))?,
-                );
+                let status = self.decode_status_token(code)?;
+                self.status_code = Some(status);
                 self.reason_phase(unparsed)
             }
             TokenStatus::Partial(rest) => {
                 self.rest.extend_from_slice(rest);
                 Ok(None)
             }
+        }
+    }
+
+    fn decode_version_token(&mut self, value: &[u8]) -> Result<Version, HttpError> {
+        // The full status line normally arrives in one read; parse borrowed
+        // token bytes directly and only allocate for truly segmented tokens.
+        if self.rest.is_empty() {
+            version_from_bytes(value)
+        } else {
+            let version = self.take_value(value);
+            version_from_bytes(version.as_slice())
+        }
+    }
+
+    fn decode_status_token(&mut self, value: &[u8]) -> Result<StatusCode, HttpError> {
+        if self.rest.is_empty() {
+            status_from_bytes(value)
+        } else {
+            let status = self.take_value(value);
+            status_from_bytes(status.as_slice())
         }
     }
 
@@ -531,6 +539,20 @@ impl ResponseDecoder {
             }
         }
     }
+}
+
+fn version_from_bytes(value: &[u8]) -> Result<Version, HttpError> {
+    match value {
+        b"HTTP/1.0" => Ok(Version::HTTP1_0),
+        b"HTTP/1.1" => Ok(Version::HTTP1_1),
+        // TODO: Support for other `HTTP` versions.
+        _ => Err(ErrorKind::H1(H1Error::InvalidResponse).into()),
+    }
+}
+
+fn status_from_bytes(value: &[u8]) -> Result<StatusCode, HttpError> {
+    StatusCode::from_bytes(value)
+        .map_err(|_| HttpError::from(ErrorKind::H1(H1Error::InvalidResponse)))
 }
 
 fn status_token(buffer: &[u8]) -> TokenResult {
