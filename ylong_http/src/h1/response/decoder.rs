@@ -488,19 +488,19 @@ impl ResponseDecoder {
         self.stage = ParseStage::Header(HeaderStage::Value);
         match get_header_value(buffer)? {
             TokenStatus::Complete((value, unparsed)) => {
-                let complete_value = self.take_value(value);
-                let header_value = if let Some(last_visible) = complete_value
+                let mut complete_value = self.take_value(value);
+                if let Some(last_visible) = complete_value
                     .iter()
                     .rposition(|b| *b != b' ' && *b != b'\t')
                 {
-                    complete_value[..last_visible + 1].to_vec()
+                    complete_value.truncate(last_visible + 1);
                 } else {
                     // Return value even it is empty.
-                    Vec::new()
-                };
+                    complete_value.clear();
+                }
                 self.headers = header_insert(
                     take(&mut self.head_key),
-                    header_value,
+                    complete_value,
                     self.headers.take().unwrap(),
                 )?;
                 Ok(Some(unparsed))
@@ -613,15 +613,11 @@ fn header_insert(
     header_value: Vec<u8>,
     mut headers: Headers,
 ) -> Result<Option<Headers>, HttpError> {
-    let name = unsafe { String::from_utf8_unchecked(header_name) };
-    let value = unsafe { String::from_utf8_unchecked(header_value) };
-    // TODO: Convert `HeaderName` to lowercase when decoding it.
-    let key = name.to_lowercase();
-    let header_name = key.as_str();
-    let header_value = value.as_str();
-    // If the response contains headers with the same name, add them to one
-    // `Headers`.
-    headers.append(header_name, header_value)?;
+    // SAFETY: `get_header_name` and `get_header_value` validate every byte
+    // before it is accumulated in `head_key` or `rest`; decode_value only
+    // trims OWS after that validation. This lets the hot path avoid a
+    // bytes -> String -> bytes round trip for obs-text-safe field values.
+    unsafe { headers.append_validated_h1(header_name, header_value) };
     Ok(Some(headers))
 }
 
@@ -894,6 +890,24 @@ mod ut_decoder {
             [] as [(&str, &str); 0],
             r#"body part"#.as_bytes()
         );
+    }
+
+    /// UT test cases for raw response header values.
+    ///
+    /// # Brief
+    /// 1. Decodes an HTTP/1 response whose header value contains obs-text.
+    /// 2. Checks that the raw byte is preserved without routing through UTF-8.
+    #[test]
+    fn ut_response_decoder_raw_header_value() {
+        let mut decoder = ResponseDecoder::new();
+        let result = decoder
+            .decode(b"HTTP/1.1 200 OK\r\nX-Raw:\x80 \t\r\n\r\n")
+            .unwrap()
+            .unwrap();
+        let value = result.0.headers.get("x-raw").unwrap();
+
+        assert_eq!(value.iter().next().unwrap().as_slice(), b"\x80");
+        assert_eq!(result.1, b"");
     }
 
     /// UT test cases for `ResponseDecoder::decode`.

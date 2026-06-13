@@ -2332,3 +2332,22 @@ trace-summary 仍显示 `request_pending_gap_p99_us=36610`、`request_pending_ga
 - `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
 
 结论：保留该改动作为通用 HTTP/1 request encoding hot-path cleanup 和 header-value raw-byte correctness cleanup；它在 strict CONNECT 下只有小幅吞吐信号且 p99 没有明显优于 libcurl，仍不是 20%+ completion path。后续不要把 request encoder allocation 作为主线继续追 strict CONNECT，除非 profiler 显示请求编码重新成为主要 CPU/allocator 热点。
+
+补充 HTTP/1 response header raw-byte fast path：`ResponseDecoder` 原先在 header insert 时把已解析的 name/value bytes 通过 `String::from_utf8_unchecked` 转成 `String`/`&str`，再交给 `Headers::append` 重新验证和复制；同时 value 右侧 OWS 修剪会把 `take_value()` 得到的 Vec 再切片复制一次。本轮给已验证 HTTP/1 parser 路径增加 crate-private unsafe raw append：header name 在原 Vec 上 ASCII lowercase 后直接构造 `HeaderName`，header value 直接构造 `HeaderValue`，并把右侧 OWS 修剪改成原地 `truncate`。unsafe 边界由 `get_header_name` / `get_header_value` 的逐字节验证保证，并在调用点注释；新增 obs-text 测试覆盖 `0x80` raw byte 不经过 UTF-8 `String` 往返。
+
+同一 native HTTPS-over-HTTPS-proxy fixture，`requests=128`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`read_buffer_size=64 KiB`、`--phase-summary`：
+
+| Client experiment | repeats | ylong avg rps | libcurl avg rps | 平均提升 | passes | formal_pass | ylong p99 avg | libcurl p99 avg | max/min 提升 | 日志 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| HTTP/1 response header raw-byte fast path | 3 | 3073.505 | 2945.349 | +4.339% | 0/3 | false | 36.175ms | 31.476ms | +6.265% / +1.762% | `target/https_proxy_bench/strict_response_header_raw_repeat3.log` |
+
+验证：
+
+- `rustfmt --check ylong_http/src/headers.rs ylong_http/src/h1/response/decoder.rs` passed with existing rustfmt-config warnings.
+- `cargo test -p ylong_http --features http1_1 ut_response_decoder -- --nocapture` passed: 4 response decoder tests, including raw obs-text header value.
+- `cargo test -p ylong_http --features http1_1 ut_headers -- --nocapture` passed: 13 header tests.
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+
+结论：保留该改动作为通用 HTTP/1 response decoding hot-path cleanup 和 obs-text correctness cleanup；strict CONNECT repeat3 仍只有 +4.339%、0/3 passes、formal_pass=false，p99 仍高于 libcurl，因此它不是 20%+ completion path。后续主线仍应回到 request future ready 后的 task resume / I/O wake tail，而不是继续深挖 header parser allocation。

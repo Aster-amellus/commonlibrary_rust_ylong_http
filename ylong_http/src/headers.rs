@@ -233,6 +233,20 @@ impl HeaderName {
         self.name.into_bytes()
     }
 
+    /// Builds a header name from bytes already checked against the HTTP/1
+    /// field-name grammar.
+    ///
+    /// # Safety
+    ///
+    /// `bytes` must contain only valid ASCII HTTP token bytes.
+    pub(crate) unsafe fn from_validated_h1_name(mut bytes: Vec<u8>) -> Self {
+        bytes.make_ascii_lowercase();
+        // SAFETY: HTTP/1 field-name bytes are validated as ASCII token bytes
+        // before this constructor is called.
+        let name = unsafe { String::from_utf8_unchecked(bytes) };
+        Self { name }
+    }
+
     /// Normalizes the input bytes.
     fn normalize(input: &[u8]) -> Result<String, HttpError> {
         let mut dst = Vec::new();
@@ -410,6 +424,19 @@ impl HeaderValue {
             content.extend_from_slice(i.as_slice());
         }
         content
+    }
+
+    /// Builds a header value from bytes already checked against the HTTP/1
+    /// field-value grammar.
+    ///
+    /// # Safety
+    ///
+    /// `bytes` must contain only legal HTTP field-value bytes.
+    pub(crate) unsafe fn from_validated_h1_value(bytes: Vec<u8>) -> Self {
+        Self {
+            inner: vec![bytes],
+            is_sensitive: false,
+        }
     }
 
     /// Returns an iterator over the `HeaderValue`.
@@ -782,6 +809,30 @@ impl Headers {
             }
         };
         Ok(())
+    }
+
+    /// Appends a decoded HTTP/1 header whose name and value bytes have already
+    /// been validated by the parser.
+    ///
+    /// # Safety
+    ///
+    /// `name` must be a valid HTTP/1 field-name and `value` must be a valid
+    /// HTTP/1 field-value with surrounding OWS already removed.
+    pub(crate) unsafe fn append_validated_h1(&mut self, name: Vec<u8>, value: Vec<u8>) {
+        // SAFETY: The caller guarantees parser-level validation for both
+        // components. This avoids revalidating and converting through `String`
+        // on the response decode hot path.
+        let name = unsafe { HeaderName::from_validated_h1_name(name) };
+        let value = unsafe { HeaderValue::from_validated_h1_value(value) };
+
+        match self.map.entry(name) {
+            Entry::Occupied(o) => {
+                o.into_mut().append(value);
+            }
+            Entry::Vacant(v) => {
+                let _ = v.insert(value);
+            }
+        };
     }
 
     /// Removes `Header` from `Headers` by `HeaderName`, returning the
