@@ -100,7 +100,9 @@ where
             })
             .await?;
 
-            message.interceptor.intercept_output(&buf[..size])?;
+            if !message.interceptor.is_empty() {
+                message.interceptor.intercept_output(&buf[..size])?;
+            }
             match decoder.decode(&buf[..size]) {
                 Ok(None) => {}
                 Ok(Some((part, rem))) => break (part, rem),
@@ -222,7 +224,9 @@ where
         match part_encoder.encode(&mut buf[..]) {
             Ok(0) => break,
             Ok(written) => {
-                interceptor.intercept_input(&buf[..written])?;
+                if !interceptor.is_empty() {
+                    interceptor.intercept_input(&buf[..written])?;
+                }
                 // RequestEncoder writes `buf` as much as possible.
                 if let Err(e) = conn.raw_mut().write_all(&buf[..written]).await {
                     conn.shutdown();

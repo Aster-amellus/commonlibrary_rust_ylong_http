@@ -47,7 +47,13 @@ where
         let (stream, cx) = unsafe { self.inner() };
         let mut buf = ReadBuf::new(buf);
         match stream.poll_read(cx, &mut buf)? {
-            Poll::Ready(()) => Ok(buf.filled().len()),
+            Poll::Ready(()) => {
+                #[cfg(feature = "ylong_base")]
+                let filled = buf.filled_len();
+                #[cfg(feature = "tokio_base")]
+                let filled = buf.filled().len();
+                Ok(filled)
+            }
             Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
         }
     }

@@ -47,6 +47,10 @@ impl InterceptorContext {
         }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.is_none()
+    }
+
     pub(crate) fn intercept_connection(&self, info: ConnDetail) -> Result<(), HttpClientError> {
         if let Some(interceptor) = &self.inner {
             interceptor.intercept_connection(info)?;

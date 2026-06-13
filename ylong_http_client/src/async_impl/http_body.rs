@@ -267,6 +267,9 @@ impl UntilClose {
             let mut read_buf = ReadBuf::new(&mut buf[read..]);
             match Pin::new(&mut io).poll_read(cx, &mut read_buf) {
                 Poll::Ready(Ok(())) => {
+                    #[cfg(feature = "ylong_base")]
+                    let filled = read_buf.filled_len();
+                    #[cfg(feature = "tokio_base")]
                     let filled = read_buf.filled().len();
                     if filled == 0 {
                         // Stream closed, and get the fin.
@@ -277,8 +280,10 @@ impl UntilClose {
                         io.shutdown();
                         return Poll::Ready(Ok(read));
                     } else {
-                        self.interceptors
-                            .intercept_output(&buf[read..(read + filled)])?;
+                        if !self.interceptors.is_empty() {
+                            self.interceptors
+                                .intercept_output(&buf[read..(read + filled)])?;
+                        }
                     }
                     read += filled;
                 }
@@ -405,6 +410,9 @@ impl Text {
             match Pin::new(&mut io).poll_read(cx, &mut read_buf) {
                 // Disconnected.
                 Poll::Ready(Ok(())) => {
+                    #[cfg(feature = "ylong_base")]
+                    let filled = read_buf.filled_len();
+                    #[cfg(feature = "tokio_base")]
                     let filled = read_buf.filled().len();
                     if filled == 0 {
                         // stream closed, and get the fin
@@ -414,7 +422,10 @@ impl Text {
                         io.shutdown();
                         return Poll::Ready(err_from_msg!(BodyDecode, "Response body incomplete"));
                     }
-                    self.interceptors.intercept_output(read_buf.filled())?;
+                    if !self.interceptors.is_empty() {
+                        self.interceptors
+                            .intercept_output(&buf[read..(read + filled)])?;
+                    }
                     read += filled;
                     match self.consume(filled) {
                         Ok(true) => {
@@ -508,13 +519,18 @@ impl Chunk {
             let mut read_buf = ReadBuf::new(&mut buf[read..]);
             match Pin::new(&mut io).poll_read(cx, &mut read_buf) {
                 Poll::Ready(Ok(())) => {
+                    #[cfg(feature = "ylong_base")]
+                    let filled = read_buf.filled_len();
+                    #[cfg(feature = "tokio_base")]
                     let filled = read_buf.filled().len();
                     if filled == 0 {
                         io.shutdown();
                         return Poll::Ready(err_from_msg!(BodyDecode, "Response body incomplete"));
                     }
                     let (size, flag) = self.merge_chunks(read_buf.filled_mut())?;
-                    self.interceptors.intercept_output(read_buf.filled_mut())?;
+                    if !self.interceptors.is_empty() {
+                        self.interceptors.intercept_output(read_buf.filled_mut())?;
+                    }
                     read += size;
                     if flag {
                         // Return if we find a 0-sized chunk.
