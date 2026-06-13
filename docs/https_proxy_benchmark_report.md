@@ -2371,3 +2371,21 @@ trace-summary 仍显示 `request_pending_gap_p99_us=36610`、`request_pending_ga
 - `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
 
 结论：保留该改动作为通用 response metadata hot-path cleanup；它减少每个响应的短生命周期分配和 UTF-8/String 转换，但 strict CONNECT repeat3 仍只有 +4.038%、0/3 passes、formal_pass=false，不能作为 20%+ completion path。后续不要继续沿 header metadata allocation 假设追主目标，除非 profiler 证明该路径重新成为主要 CPU/allocator 热点。
+
+补充 async HTTP/1 request body encoding decision cleanup：`encode_various_body()` 原先在每个 request 上先把 `Content-Length` 转成 `String` 并解析成整数，只为了区分两个最终都走 `TextBody::from_async_reader()` 的非 chunked 分支；GET / empty body 虽然会跳过 body encoder，但仍会支付这段前置 header 检查成本。本轮把决策收敛为私有 `RequestBodyEncoding::{None, Text, Chunk}`：只用 raw header bytes 判断 `Transfer-Encoding: chunked`，非 chunked 空 body 直接返回，非 chunked 非空 body 一律走 `TextBody`。注释说明 `Content-Length` 不影响 HTTP/1 encoder 选择；新增测试覆盖 empty+content-length、empty+chunked 和 non-empty 三个分支。
+
+同一 native HTTPS-over-HTTPS-proxy fixture，`requests=128`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`read_buffer_size=64 KiB`、`--phase-summary`：
+
+| Client experiment | repeats | ylong avg rps | libcurl avg rps | 平均提升 | passes | formal_pass | ylong p99 avg | libcurl p99 avg | max/min 提升 | 日志 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| async HTTP/1 request body encoding decision cleanup | 3 | 3023.922 | 2895.973 | +4.602% | 0/3 | false | 35.808ms | 32.257ms | +12.693% / -6.985% | `target/https_proxy_bench/strict_request_body_encoding_repeat3.log` |
+
+验证：
+
+- `rustfmt --check ylong_http_client/src/async_impl/conn/http1.rs` passed with existing rustfmt-config warnings.
+- `git diff --check` passed.
+- `cargo test -p ylong_http_client ut_request_body_encoding --features "async http1_1 ylong_base" -- --nocapture` passed: 3 tests.
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+
+结论：保留该改动作为 async HTTP/1 request hot-path cleanup；它删除无行为价值的 `Content-Length` String parse，并让 empty-body 跳过路径更直接。但 strict CONNECT repeat3 仍只有 +4.602%、0/3 passes、formal_pass=false，不能作为 20%+ completion path。后续不要继续沿 empty request body encoder 判断追主目标，除非 profiler 显示 request-send CPU 开销重新成为主要瓶颈。

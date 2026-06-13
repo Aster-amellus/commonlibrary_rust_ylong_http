@@ -37,6 +37,13 @@ use crate::ErrorKind::BodyTransfer;
 
 const TEMP_BUF_SIZE: usize = 16 * 1024;
 
+#[derive(Debug, Eq, PartialEq)]
+enum RequestBodyEncoding {
+    None,
+    Text,
+    Chunk,
+}
+
 pub(crate) async fn request<S>(
     mut conn: Http1Conn<S>,
     mut message: Message,
@@ -154,43 +161,38 @@ async fn encode_various_body<S>(
 where
     S: AsyncRead + AsyncWrite + Sync + Send + Unpin + 'static,
 {
-    let content_length = request
-        .part()
-        .headers
-        .get("Content-Length")
-        .and_then(|v| v.to_string().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .is_some();
-
-    let transfer_encoding = request
-        .part()
-        .headers
-        .get("Transfer-Encoding")
-        .and_then(|v| v.to_string().ok())
-        .map(|v| v.contains("chunked"))
-        .unwrap_or(false);
-
-    if !transfer_encoding && request.body().is_empty() {
-        return Ok(());
-    }
-
-    let body = request.body_mut();
-
-    match (content_length, transfer_encoding) {
-        (_, true) => {
+    match request_body_encoding(request) {
+        RequestBodyEncoding::None => {}
+        RequestBodyEncoding::Chunk => {
+            let body = request.body_mut();
             let body = ChunkBody::from_async_reader(body);
             encode_body(conn, body, buf).await?;
         }
-        (true, false) => {
-            let body = TextBody::from_async_reader(body);
-            encode_body(conn, body, buf).await?;
-        }
-        (false, false) => {
+        RequestBodyEncoding::Text => {
+            let body = request.body_mut();
             let body = TextBody::from_async_reader(body);
             encode_body(conn, body, buf).await?;
         }
     };
     Ok(())
+}
+
+fn request_body_encoding(request: &Request) -> RequestBodyEncoding {
+    let transfer_encoding = request
+        .part()
+        .headers
+        .get("Transfer-Encoding")
+        .is_some_and(|v| header_value_contains(v, b"chunked"));
+
+    if transfer_encoding {
+        RequestBodyEncoding::Chunk
+    } else if request.body().is_empty() {
+        RequestBodyEncoding::None
+    } else {
+        // Content-Length does not change the HTTP/1 encoder choice: every
+        // non-chunked, non-empty body is encoded as a plain text body.
+        RequestBodyEncoding::Text
+    }
 }
 
 async fn encode_request_part<S>(
@@ -421,5 +423,38 @@ impl<S: AsyncRead + Unpin> StreamData for Http1Conn<S> {
 
     fn http_version(&self) -> HttpVersion {
         HttpVersion::Http1
+    }
+}
+
+#[cfg(test)]
+mod ut_http1_conn {
+    use crate::async_impl::{Body as ClientBody, Request as ClientRequest};
+
+    use super::{request_body_encoding, RequestBodyEncoding};
+
+    #[test]
+    fn ut_request_body_encoding_skips_empty_non_chunked() {
+        let request = ClientRequest::builder()
+            .header("Content-Length", "0")
+            .body(ClientBody::empty())
+            .unwrap();
+        assert_eq!(request_body_encoding(&request), RequestBodyEncoding::None);
+    }
+
+    #[test]
+    fn ut_request_body_encoding_keeps_empty_chunked() {
+        let request = ClientRequest::builder()
+            .header("Transfer-Encoding", "gzip, chunked")
+            .body(ClientBody::empty())
+            .unwrap();
+        assert_eq!(request_body_encoding(&request), RequestBodyEncoding::Chunk);
+    }
+
+    #[test]
+    fn ut_request_body_encoding_uses_text_for_non_empty() {
+        let request = ClientRequest::builder()
+            .body(ClientBody::slice("request body"))
+            .unwrap();
+        assert_eq!(request_body_encoding(&request), RequestBodyEncoding::Text);
     }
 }
