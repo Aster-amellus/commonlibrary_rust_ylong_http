@@ -433,25 +433,19 @@ impl EncodeMethod {
 }
 
 struct EncodeUri {
-    absolute: Vec<u8>,
     origin: Vec<u8>,
+    absolute: Option<Vec<u8>>,
+    raw: Uri,
     src_idx: usize,
     is_absolute: bool,
 }
 
 impl EncodeUri {
     fn new(uri: Uri, is_absolute: bool) -> Self {
-        let mut origin_form = vec![];
-        let path = uri.path_and_query();
-        if let Some(p) = path {
-            origin_form = p.as_bytes().to_vec();
-        } else {
-            origin_form.extend_from_slice(b"/");
-        }
-        let init_uri = uri.to_string().into_bytes();
         Self {
-            absolute: init_uri,
-            origin: origin_form,
+            origin: origin_form(&uri),
+            absolute: None,
+            raw: uri,
             src_idx: 0,
             is_absolute,
         }
@@ -460,10 +454,64 @@ impl EncodeUri {
     fn encode(&mut self, buf: &mut [u8]) -> TokenResult<usize> {
         let mut uri = self.origin.as_slice();
         if self.is_absolute {
-            uri = self.absolute.as_slice();
+            // Most client requests use origin-form. Generate absolute-form only
+            // when a proxy request actually needs it, avoiding one URI format
+            // allocation on the direct and HTTPS-tunnel hot paths.
+            uri = self
+                .absolute
+                .get_or_insert_with(|| absolute_form(&self.raw))
+                .as_slice();
         }
         WriteData::new(uri, &mut self.src_idx, buf).write()
     }
+}
+
+fn origin_form(uri: &Uri) -> Vec<u8> {
+    match (uri.path(), uri.query()) {
+        (None, None) => b"/".to_vec(),
+        (path, query) => {
+            let path_len = path.map(|p| p.as_str().len()).unwrap_or(0);
+            let query_len = query.map(|q| q.as_str().len() + 1).unwrap_or(0);
+            let mut out = Vec::with_capacity(path_len + query_len);
+            if let Some(path) = path {
+                out.extend_from_slice(path.as_str().as_bytes());
+            }
+            if let Some(query) = query {
+                out.push(b'?');
+                out.extend_from_slice(query.as_str().as_bytes());
+            }
+            out
+        }
+    }
+}
+
+fn absolute_form(uri: &Uri) -> Vec<u8> {
+    let scheme_len = uri.scheme().map(|s| s.as_str().len() + 3).unwrap_or(0);
+    let host_len = uri.host().map(|h| h.as_str().len()).unwrap_or(0);
+    let port_len = uri.port().map(|p| p.as_str().len() + 1).unwrap_or(0);
+    let path_len = uri.path().map(|p| p.as_str().len()).unwrap_or(0);
+    let query_len = uri.query().map(|q| q.as_str().len() + 1).unwrap_or(0);
+    let mut out = Vec::with_capacity(scheme_len + host_len + port_len + path_len + query_len);
+
+    if let Some(scheme) = uri.scheme() {
+        out.extend_from_slice(scheme.as_str().as_bytes());
+        out.extend_from_slice(b"://");
+    }
+    if let Some(host) = uri.host() {
+        out.extend_from_slice(host.as_str().as_bytes());
+    }
+    if let Some(port) = uri.port() {
+        out.push(b':');
+        out.extend_from_slice(port.as_str().as_bytes());
+    }
+    if let Some(path) = uri.path() {
+        out.extend_from_slice(path.as_str().as_bytes());
+    }
+    if let Some(query) = uri.query() {
+        out.push(b'?');
+        out.extend_from_slice(query.as_str().as_bytes());
+    }
+    out
 }
 
 struct EncodeVersion {
@@ -512,7 +560,7 @@ impl EncodeHeader {
                 inner: header_iter,
                 status: Some(HeaderStatus::Name),
                 name: header_name,
-                value: header_value.to_string().unwrap().into_bytes(),
+                value: header_value.to_vec(),
                 name_idx: 0,
                 colon_idx: 0,
                 value_idx: 0,
@@ -593,7 +641,7 @@ impl EncodeHeader {
                     let (header_name, header_value) = iter;
                     self.status = Some(HeaderStatus::Name);
                     self.name = header_name;
-                    self.value = header_value.to_string().unwrap().into_bytes();
+                    self.value = header_value.to_vec();
                     self.name_idx = 0;
                     self.colon_idx = 0;
                     self.value_idx = 0;
@@ -798,5 +846,68 @@ mod ut_request_encoder {
         let size = encoder.encode(&mut buf).unwrap();
         let res = std::str::from_utf8(&buf[..size]).unwrap();
         assert_eq!(res, "GET / HTTP/1.1\r\n\r\n");
+    }
+
+    /// UT test cases for lazy absolute-form URI encoding.
+    ///
+    /// # Brief
+    /// 1. Encodes an absolute URI request in origin-form.
+    /// 2. Checks that the absolute URI cache is not generated.
+    /// 3. Encodes the same request in absolute-form and checks the output.
+    #[test]
+    fn ut_request_encoder_lazy_absolute_uri() {
+        let request = RequestBuilder::new()
+            .method("GET")
+            .url("http://example.com:80/foo?a=1")
+            .version("HTTP/1.1")
+            .body(())
+            .unwrap();
+        let (part, _) = request.into_parts();
+        let mut encoder = RequestEncoder::new(part);
+
+        let mut buf = [0u8; 128];
+        let size = encoder.encode(&mut buf).unwrap();
+        assert_eq!(&buf[..size], b"GET /foo?a=1 HTTP/1.1\r\n\r\n");
+        assert!(encoder.uri_part.absolute.is_none());
+
+        let request = RequestBuilder::new()
+            .method("GET")
+            .url("http://example.com:80/foo?a=1")
+            .version("HTTP/1.1")
+            .body(())
+            .unwrap();
+        let (part, _) = request.into_parts();
+        let mut encoder = RequestEncoder::new(part);
+        encoder.absolute_uri(true);
+
+        let size = encoder.encode(&mut buf).unwrap();
+        assert_eq!(
+            &buf[..size],
+            b"GET http://example.com:80/foo?a=1 HTTP/1.1\r\n\r\n"
+        );
+        assert!(encoder.uri_part.absolute.is_some());
+    }
+
+    /// UT test cases for header value raw-byte encoding.
+    ///
+    /// # Brief
+    /// 1. Creates a request with a non-ASCII but HTTP-valid field value byte.
+    /// 2. Encodes it without converting the value through `String`.
+    /// 3. Checks that the raw byte is preserved in the wire output.
+    #[test]
+    fn ut_request_encoder_header_value_raw_bytes() {
+        let request = RequestBuilder::new()
+            .method("GET")
+            .url("/")
+            .version("HTTP/1.1")
+            .header("X-Raw", b"\x80".as_slice())
+            .body(())
+            .unwrap();
+        let (part, _) = request.into_parts();
+        let mut encoder = RequestEncoder::new(part);
+
+        let mut buf = [0u8; 128];
+        let size = encoder.encode(&mut buf).unwrap();
+        assert_eq!(&buf[..size], b"GET / HTTP/1.1\r\nx-raw:\x80\r\n\r\n");
     }
 }

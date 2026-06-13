@@ -2314,3 +2314,21 @@ trace-summary 仍显示 `request_pending_gap_p99_us=36610`、`request_pending_ga
 - `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed while the temporary patch was active.
 
 诊断价值：round-robin scan did not improve strict CONNECT; p99 regressed and one paired sample was negative. The fixed newest-first reuse pattern is likely preserving useful connection/cache locality, and the lock/list cleanup cost is not the dominant tail source at this workload. Do not reintroduce H1 pool cursoring as a primary completion path without fresh profiler evidence.
+
+补充 HTTP/1 request encoder allocation trim：`RequestEncoder::new` 原先总是同时生成 origin-form 和 absolute-form URI bytes，即使普通 direct 请求与 HTTPS-over-HTTPS-proxy CONNECT 后的 origin 请求只会编码 origin-form；header value 编码也经 `HeaderValue::to_string().unwrap().into_bytes()` 中转。本轮改为只在 `absolute_uri(true)` 真正编码时懒生成 absolute-form，并直接从 `Uri` path/query 与 `HeaderValue::to_vec()` 组装 wire bytes，避免热请求行/头部编码中的无用 `String` 中转；同时保留一条注释说明 absolute-form 懒生成的 hot-path 边界。该改动还避免对 RFC 允许的 `0x80..=0xff` header field value 先构造潜在非 UTF-8 `String`。
+
+同一 native HTTPS-over-HTTPS-proxy fixture，`requests=128`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`read_buffer_size=64 KiB`、`--phase-summary`：
+
+| Client experiment | repeats | ylong avg rps | libcurl avg rps | 平均提升 | passes | formal_pass | ylong p99 avg | libcurl p99 avg | max/min 提升 | 日志 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| HTTP/1 request encoder allocation trim | 3 | 3078.878 | 2966.573 | +4.111% | 0/3 | false | 35.287ms | 35.086ms | +12.390% / -0.700% | `target/https_proxy_bench/strict_request_encoder_fast_path_repeat3.log` |
+
+验证：
+
+- `rustfmt --check ylong_http/src/h1/request/encoder.rs` passed with existing rustfmt-config warnings.
+- `cargo test -p ylong_http --features http1_1 ut_request_encoder -- --nocapture` passed: 5 encoder tests, including lazy absolute URI and raw header-value bytes.
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+
+结论：保留该改动作为通用 HTTP/1 request encoding hot-path cleanup 和 header-value raw-byte correctness cleanup；它在 strict CONNECT 下只有小幅吞吐信号且 p99 没有明显优于 libcurl，仍不是 20%+ completion path。后续不要把 request encoder allocation 作为主线继续追 strict CONNECT，除非 profiler 显示请求编码重新成为主要 CPU/allocator 热点。
