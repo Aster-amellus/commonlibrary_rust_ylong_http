@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 #[cfg(all(feature = "ylong_base", not(feature = "tokio_base")))]
 use ylong_runtime::builder::RuntimeBuilder;
 #[cfg(all(feature = "ylong_base", not(feature = "tokio_base")))]
-use ylong_runtime::sync::mpsc;
+use ylong_runtime::sync::{mpsc, watch};
 #[cfg(all(feature = "ylong_base", not(feature = "tokio_base")))]
 use ylong_runtime::task::JoinHandle;
 
@@ -908,7 +908,7 @@ where
 enum StartGate {
     Async {
         ready_tx: mpsc::UnboundedSender<()>,
-        start_rx: mpsc::UnboundedReceiver<Instant>,
+        start_rx: watch::Receiver<Option<Instant>>,
     },
     #[cfg(feature = "__ylong_current_thread_runtime")]
     Thread {
@@ -923,34 +923,26 @@ struct StartCoordinator {
     workers: usize,
     ready_rx: mpsc::UnboundedReceiver<()>,
     ready_tx: mpsc::UnboundedSender<()>,
-    start_txs: Vec<mpsc::UnboundedSender<Instant>>,
-    start_rxs: Vec<mpsc::UnboundedReceiver<Instant>>,
+    start_tx: watch::Sender<Option<Instant>>,
 }
 
 #[cfg(all(feature = "ylong_base", not(feature = "tokio_base")))]
 impl StartCoordinator {
     fn new(workers: usize) -> Self {
         let (ready_tx, ready_rx) = mpsc::unbounded_channel();
-        let mut start_txs = Vec::with_capacity(workers);
-        let mut start_rxs = Vec::with_capacity(workers);
-        for _ in 0..workers {
-            let (start_tx, start_rx) = mpsc::unbounded_channel();
-            start_txs.push(start_tx);
-            start_rxs.push(start_rx);
-        }
+        let (start_tx, _) = watch::channel(None);
         Self {
             workers,
             ready_rx,
             ready_tx,
-            start_txs,
-            start_rxs,
+            start_tx,
         }
     }
 
     fn worker_gate(&mut self) -> StartGate {
         StartGate::Async {
             ready_tx: self.ready_tx.clone(),
-            start_rx: self.start_rxs.pop().expect("missing worker start gate"),
+            start_rx: self.start_tx.subscribe(),
         }
     }
 
@@ -961,9 +953,9 @@ impl StartCoordinator {
             }
         }
         let started = Instant::now();
-        for start_tx in &self.start_txs {
-            let _ = start_tx.send(started);
-        }
+        // A single watch broadcast avoids O(workers) start-channel sends in the
+        // timed window; worker receivers are versioned, so they cannot miss it.
+        let _ = self.start_tx.send(Some(started));
         started
     }
 }
@@ -976,7 +968,11 @@ async fn worker_ready_and_wait(gate: StartGate) -> Instant {
             mut start_rx,
         } => {
             let _ = ready_tx.send(());
-            start_rx.recv().await.unwrap_or_else(|_| Instant::now())
+            if start_rx.notified().await.is_ok() {
+                start_rx.borrow_notify().unwrap_or_else(Instant::now)
+            } else {
+                Instant::now()
+            }
         }
         #[cfg(feature = "__ylong_current_thread_runtime")]
         StartGate::Thread {

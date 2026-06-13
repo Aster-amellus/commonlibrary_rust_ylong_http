@@ -2447,3 +2447,21 @@ trace-summary 仍显示 `request_pending_gap_p99_us=36610`、`request_pending_ga
 - `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings while the temporary patch was active.
 
 诊断价值：simple cross-crate inline hints are not enough to close the strict CONNECT gap. The remaining gap still points to async I/O wake / task resume tail rather than ordinary response body helper call overhead. Do not reintroduce broad inline annotations on this path unless fresh profiler evidence shows call-boundary overhead after larger scheduler/I/O changes.
+
+补充 async-ylong benchmark start gate broadcast：`async_https_proxy_bench` 的 ylong multi-thread 起跑门闩原先为每个 worker 持有一个 start mpsc channel，并在 timed window 起点逐个 `send(started)`；短 CONNECT workload 下，这会把 O(workers) 起跑分发成本和 worker start-delay 抖动计入 ylong elapsed。此次把 ylong cfg 下的 start 门闩改为单个 `watch::Sender<Option<Instant>>` 广播，worker receiver 在任务创建时通过 `subscribe()` 注册，报到后等待版本更新。`watch` receiver 使用版本号，能覆盖“start 先于 await 到达”的 race；代码注释记录了这个不变量。tokio 路径不变。
+
+同一 native HTTPS-over-HTTPS-proxy fixture，`requests=128`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`read_buffer_size=64 KiB`、`--phase-summary`：
+
+| Client experiment | repeats | ylong avg rps | libcurl avg rps | 平均提升 | passes | formal_pass | ylong p99 avg | libcurl p99 avg | ylong start-delay max avg | libcurl start-delay max avg | max/min 提升 | 日志 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| async-ylong watch start broadcast | 3 | 3103.574 | 2860.227 | +8.589% | 0/3 | false | 34.961ms | 31.508ms | 2.344ms | 2.421ms | +13.666% / +5.151% | `target/https_proxy_bench/strict_start_watch_repeat3.log` |
+
+验证：
+
+- `rustfmt --check ylong_http_client/examples/async_https_proxy_bench.rs` passed with existing rustfmt-config warnings.
+- `git diff --check` passed.
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+
+结论：保留该改动作为 benchmark fairness/perf cleanup：它减少 ylong 自身起跑分发噪声，使 ylong/libcurl 的 start-delay max avg 接近（2.344ms vs 2.421ms）。但 strict CONNECT 仍只有 +8.589%、0/3 passes、formal_pass=false，且 ylong p99 仍弱于 libcurl，所以目标仍未完成。后续主线应继续追 request/response body pending gap 和 runtime I/O wake，而不是再调起跑门闩。
