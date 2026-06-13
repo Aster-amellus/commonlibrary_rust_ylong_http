@@ -2408,3 +2408,22 @@ trace-summary 仍显示 `request_pending_gap_p99_us=36610`、`request_pending_ga
 - `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
 
 结论：保留该改动作为通用 HTTP/1 response status-line parsing cleanup；它删除普通响应中的两个小分配，跨段状态行仍保持原行为。strict CONNECT repeat3 仍只有 +5.517%、0/3 passes、formal_pass=false，p99 仍弱于 libcurl，因此它不是 20%+ completion path。后续不要继续深挖 status-line token allocation，除非 profiler 显示 response parser CPU 成为新的主瓶颈。
+
+补充 HTTP/1 response status-line prefix 负实验：在 borrowed-token fast path 之后，本轮临时尝试对完整 `HTTP/1.1 ` / `HTTP/1.0 ` 状态行前缀做更激进的直接匹配，以跳过 `status_token()` 对 version/status 的空格扫描。该路径只在 `rest` 为空、前缀完整且 status 后跟空格时命中，分段或非标准状态行仍回退到原状态机；但 strict 复测显示额外前缀匹配分支没有收益，因此该源码改动已撤回。
+
+同一 native HTTPS-over-HTTPS-proxy fixture，`requests=128`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`read_buffer_size=64 KiB`、`--phase-summary`：
+
+| Client experiment | repeats | ylong avg rps | libcurl avg rps | 平均提升 | passes | formal_pass | ylong p99 avg | libcurl p99 avg | max/min 提升 | 日志 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| HTTP/1 response status-line prefix fast path | 3 | 2992.209 | 3020.317 | -0.675% | 0/3 | false | 37.398ms | 30.138ms | +7.735% / -13.011% | `target/https_proxy_bench/strict_response_status_line_prefix_repeat3.log` |
+
+验证：
+
+- `rustfmt --check ylong_http/src/h1/response/decoder.rs` passed with existing rustfmt-config warnings while the temporary patch was active.
+- `git diff --check` passed while the temporary patch was active.
+- `cargo test -p ylong_http --features http1_1 ut_response_decoder -- --nocapture` passed: 4 response decoder tests while the temporary patch was active.
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"` passed with existing warnings while the temporary patch was active.
+- `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed with existing warnings while the temporary patch was active.
+- `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings while the temporary patch was active.
+
+诊断价值：status line 已不是 strict CONNECT 的有效优化面；更细粒度的 fixed-prefix 判断反而增加热路径分支/比较成本，并放大 p99 弱势。除非 profiler 明确显示 parser 空格扫描重新成为热点，否则不要再沿 status-line prefix 方向追主目标。
