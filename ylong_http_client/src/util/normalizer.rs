@@ -11,6 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use ylong_http::headers::HeaderValue;
 use ylong_http::request::method::Method;
 use ylong_http::request::uri::{Scheme, Uri};
 use ylong_http::request::Request;
@@ -159,10 +160,8 @@ impl<'a> BodyLengthParser<'a> {
                 if self.part.version == Version::HTTP1_0 {
                     return err_from_msg!(Request, "Illegal Transfer-Encoding in HTTP/1.0");
                 }
-                let transfer_encoding_contains_chunk = transfer_encoding
-                    .and_then(|v| v.to_string().ok())
-                    .and_then(|str| str.find("chunked"))
-                    .is_some();
+                let transfer_encoding_contains_chunk =
+                    transfer_encoding.is_some_and(|v| header_value_contains(v, b"chunked"));
 
                 return if transfer_encoding_contains_chunk {
                     Ok(BodyLength::Chunk)
@@ -175,9 +174,7 @@ impl<'a> BodyLengthParser<'a> {
         let content_length = self.part.headers.get("Content-Length");
 
         if content_length.is_some() {
-            let content_length_valid = content_length
-                .and_then(|v| v.to_string().ok())
-                .and_then(|s| s.parse::<u64>().ok());
+            let content_length_valid = content_length.and_then(header_value_to_u64);
 
             return match content_length_valid {
                 // If `content-length` is 0, the io stream cannot be read,
@@ -198,6 +195,39 @@ pub(crate) enum BodyLength {
     Length(u64),
     Empty,
     UntilClose,
+}
+
+pub(crate) fn header_value_contains(value: &HeaderValue, needle: &[u8]) -> bool {
+    value.iter().any(|part| bytes_contains(part, needle))
+}
+
+pub(crate) fn header_value_to_u64(value: &HeaderValue) -> Option<u64> {
+    let mut parts = value.iter();
+    let bytes = parts.next()?;
+    if parts.next().is_some() || bytes.is_empty() {
+        return None;
+    }
+
+    let mut parsed = 0u64;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        parsed = parsed.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
+    }
+    Some(parsed)
+}
+
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 pub(crate) fn format_host_value(uri: &Uri) -> Result<String, HttpClientError> {
@@ -224,13 +254,15 @@ pub(crate) fn format_host_value(uri: &Uri) -> Result<String, HttpClientError> {
 #[cfg(test)]
 mod ut_normalizer {
     use ylong_http::h1::ResponseDecoder;
+    use ylong_http::headers::HeaderValue;
     use ylong_http::request::method::Method;
     use ylong_http::request::uri::{Uri, UriBuilder};
     use ylong_http::request::Request;
 
     use crate::normalizer::UriFormatter;
     use crate::util::normalizer::{
-        format_host_value, BodyLength, BodyLengthParser, RequestFormatter,
+        format_host_value, header_value_contains, header_value_to_u64, BodyLength,
+        BodyLengthParser, RequestFormatter,
     };
 
     /// UT test cases for `UriFormatter::format`.
@@ -339,6 +371,35 @@ mod ut_normalizer {
                 e
             })
             .is_err());
+
+        let response_str = b"HTTP/1.1 202 \r\nContent-Length: \t 20\x80 \t \t\r\n\r\n";
+        let mut decoder = ResponseDecoder::new();
+        let result = decoder.decode(response_str).unwrap().unwrap();
+        let method = Method::GET;
+        let body_len_parser = BodyLengthParser::new(&method, &result.0);
+        assert!(body_len_parser.parse().is_err());
+
+        let response_str = b"HTTP/1.1 202 \r\nContent-Length: 20\r\nContent-Length: 21\r\n\r\n";
+        let mut decoder = ResponseDecoder::new();
+        let result = decoder.decode(response_str).unwrap().unwrap();
+        let method = Method::GET;
+        let body_len_parser = BodyLengthParser::new(&method, &result.0);
+        assert!(body_len_parser.parse().is_err());
+    }
+
+    #[test]
+    fn ut_header_value_raw_helpers() {
+        let value = HeaderValue::from_bytes(b"gzip, chunked").unwrap();
+        assert!(header_value_contains(&value, b"chunked"));
+        assert!(!header_value_contains(&value, b"br"));
+        assert_eq!(header_value_to_u64(&value), None);
+
+        let value = HeaderValue::from_bytes(b"18446744073709551616").unwrap();
+        assert_eq!(header_value_to_u64(&value), None);
+
+        let mut value = HeaderValue::from_bytes(b"20").unwrap();
+        value.append_bytes(b"21").unwrap();
+        assert_eq!(header_value_to_u64(&value), None);
     }
 
     /// UT test cases for function `format_host_value`.

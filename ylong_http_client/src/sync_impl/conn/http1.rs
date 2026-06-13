@@ -22,6 +22,7 @@ use crate::error::{ErrorKind, HttpClientError};
 use crate::sync_impl::conn::StreamData;
 use crate::sync_impl::HttpBody;
 use crate::util::dispatcher::http1::Http1Conn;
+use crate::util::normalizer::{header_value_contains, header_value_to_u64};
 
 const TEMP_BUF_SIZE: usize = 16 * 1024;
 
@@ -112,14 +113,11 @@ where
         let chunked = part
             .headers
             .get("Transfer-Encoding")
-            .map(|v| v.to_string().unwrap_or(String::new()))
-            .and_then(|s| s.find("chunked"))
-            .is_some();
+            .is_some_and(|v| header_value_contains(v, b"chunked"));
         let content_length = part
             .headers
             .get("Content-Length")
-            .map(|v| v.to_string().unwrap_or(String::new()))
-            .and_then(|s| s.parse::<u64>().ok());
+            .and_then(header_value_to_u64);
 
         let is_trailer = part.headers.get("Trailer").is_some();
 

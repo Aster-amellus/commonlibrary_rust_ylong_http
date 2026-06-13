@@ -2351,3 +2351,23 @@ trace-summary 仍显示 `request_pending_gap_p99_us=36610`、`request_pending_ga
 - `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
 
 结论：保留该改动作为通用 HTTP/1 response decoding hot-path cleanup 和 obs-text correctness cleanup；strict CONNECT repeat3 仍只有 +4.339%、0/3 passes、formal_pass=false，p99 仍高于 libcurl，因此它不是 20%+ completion path。后续主线仍应回到 request future ready 后的 task resume / I/O wake tail，而不是继续深挖 header parser allocation。
+
+补充 HTTP/1 response metadata raw parse：客户端在收到响应后仍会为 `Transfer-Encoding`、`Content-Length` 和 `Connection` 调用 `HeaderValue::to_string()`，即使这些字段只需要 ASCII 子串匹配或十进制整数解析。本轮把 async/sync HTTP/1 响应元数据解析改为直接遍历 `HeaderValue` 的 raw byte parts：`chunked` / `close` / `keep-alive` 仍保持原有大小写敏感匹配语义，`Content-Length` 只接受单个非空十进制值并用 checked arithmetic 拒绝溢出；重复值、obs-text 和非数字会继续走错误路径。该改动避免热响应路径上的 UTF-8/String 中转，同时用测试覆盖非法 obs-text、重复 `Content-Length` 和溢出。
+
+同一 native HTTPS-over-HTTPS-proxy fixture，`requests=128`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`read_buffer_size=64 KiB`、`--phase-summary`：
+
+| Client experiment | repeats | ylong avg rps | libcurl avg rps | 平均提升 | passes | formal_pass | ylong p99 avg | libcurl p99 avg | max/min 提升 | 日志 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| HTTP/1 response metadata raw parse | 3 | 2518.975 | 2429.275 | +4.038% | 0/3 | false | 39.822ms | 38.901ms | +10.764% / -3.577% | `target/https_proxy_bench/strict_header_value_raw_parse_repeat3.log` |
+
+验证：
+
+- `rustfmt --check ylong_http_client/src/util/normalizer.rs ylong_http_client/src/async_impl/conn/http1.rs ylong_http_client/src/sync_impl/conn/http1.rs` passed with existing rustfmt-config warnings.
+- `git diff --check` passed.
+- `cargo test -p ylong_http_client ut_header_value_raw_helpers --features "async http1_1 ylong_base" -- --nocapture` passed.
+- `cargo test -p ylong_http_client ut_body_length_parser --features "async http1_1 ylong_base" -- --nocapture` passed.
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+
+结论：保留该改动作为通用 response metadata hot-path cleanup；它减少每个响应的短生命周期分配和 UTF-8/String 转换，但 strict CONNECT repeat3 仍只有 +4.038%、0/3 passes、formal_pass=false，不能作为 20%+ completion path。后续不要继续沿 header metadata allocation 假设追主目标，除非 profiler 证明该路径重新成为主要 CPU/allocator 热点。

@@ -32,7 +32,7 @@ use crate::util::config::HttpVersion;
 use crate::util::dispatcher::http1::Http1Conn;
 use crate::util::information::ConnInfo;
 use crate::util::interceptor::InterceptorContext;
-use crate::util::normalizer::BodyLengthParser;
+use crate::util::normalizer::{header_value_contains, BodyLengthParser};
 use crate::ErrorKind::BodyTransfer;
 
 const TEMP_BUF_SIZE: usize = 16 * 1024;
@@ -257,20 +257,10 @@ where
         }
         Some(value) => {
             if part.version == Version::HTTP1_0 {
-                if value
-                    .to_string()
-                    .ok()
-                    .and_then(|v| v.find("keep-alive"))
-                    .is_none()
-                {
+                if !header_value_contains(value, b"keep-alive") {
                     conn.shutdown()
                 }
-            } else if value
-                .to_string()
-                .ok()
-                .and_then(|v| v.find("close"))
-                .is_some()
-            {
+            } else if header_value_contains(value, b"close") {
                 conn.shutdown()
             }
         }
