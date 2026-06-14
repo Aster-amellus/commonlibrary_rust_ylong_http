@@ -56,7 +56,12 @@ where
 
     // TODO Implement trailer.
     let is_body_empty = message.request.ref_mut().body().is_empty();
-    let no_length = message.request.ref_mut().headers().get("content-length").is_none();
+    let no_length = message
+        .request
+        .ref_mut()
+        .headers()
+        .get_lowercase("content-length")
+        .is_none();
     let (flag, payload) = build_headers_payload(part, is_body_empty && no_length)
         .map_err(|e| HttpClientError::from_error(ErrorKind::Request, e))?;
     let data = BodyDataRef::new(message.request.clone(), conn.speed_controller.clone());
@@ -171,7 +176,7 @@ fn remove_connection_specific_headers(headers: &mut Headers) -> Result<(), HttpE
         headers.remove(*specific_header);
     }
 
-    if let Some(te_ref) = headers.get("te") {
+    if let Some(te_ref) = headers.get_lowercase("te") {
         let te = te_ref.to_string()?;
         if te.as_str() != "trailers" {
             headers.remove("te");

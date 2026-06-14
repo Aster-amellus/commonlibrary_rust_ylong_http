@@ -183,7 +183,7 @@ fn request_body_encoding(request: &Request) -> RequestBodyEncoding {
     let transfer_encoding = request
         .part()
         .headers
-        .get("Transfer-Encoding")
+        .get_lowercase("transfer-encoding")
         .is_some_and(|v| header_value_contains(v, b"chunked"));
 
     if transfer_encoding {
@@ -255,7 +255,7 @@ where
     // and does not release the connection immediately.
     // Instead, the connection will be completely closed
     // when the body has finished reading or when the body is released.
-    match part.headers.get("Connection") {
+    match part.headers.get_lowercase("connection") {
         None => {
             if part.version == Version::HTTP1_0 {
                 conn.shutdown()

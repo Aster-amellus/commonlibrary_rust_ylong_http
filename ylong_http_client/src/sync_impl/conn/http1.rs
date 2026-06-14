@@ -112,14 +112,14 @@ where
     let body = {
         let chunked = part
             .headers
-            .get("Transfer-Encoding")
+            .get_lowercase("transfer-encoding")
             .is_some_and(|v| header_value_contains(v, b"chunked"));
         let content_length = part
             .headers
-            .get("Content-Length")
+            .get_lowercase("content-length")
             .and_then(header_value_to_u64);
 
-        let is_trailer = part.headers.get("Trailer").is_some();
+        let is_trailer = part.headers.get_lowercase("trailer").is_some();
 
         match (chunked, content_length, pre.is_empty()) {
             (true, None, _) => HttpBody::chunk(pre, Box::new(conn), is_trailer),

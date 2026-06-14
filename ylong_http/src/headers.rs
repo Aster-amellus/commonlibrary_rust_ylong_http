@@ -44,6 +44,7 @@
 //! );
 //! ```
 
+use core::borrow::Borrow;
 use core::convert::TryFrom;
 use core::{fmt, slice, str};
 use std::collections::hash_map::Entry;
@@ -292,6 +293,12 @@ impl TryFrom<&[u8]> for HeaderName {
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
         Self::from_bytes(bytes)
+    }
+}
+
+impl Borrow<str> for HeaderName {
+    fn borrow(&self) -> &str {
+        self.name.as_str()
     }
 }
 
@@ -700,6 +707,18 @@ impl Headers {
         HeaderName::try_from(name)
             .ok()
             .and_then(|name| self.map.get(&name))
+    }
+
+    /// Returns a header value by an already-normalized lowercase header name.
+    ///
+    /// This avoids constructing a temporary [`HeaderName`] for hot paths that
+    /// query fixed field names already known to be lowercase. Use [`get`] for
+    /// user-provided or mixed-case names.
+    ///
+    /// [`get`]: Headers::get
+    pub fn get_lowercase(&self, name: &str) -> Option<&HeaderValue> {
+        debug_assert!(name.bytes().all(|b| !b.is_ascii_uppercase()));
+        self.map.get(name)
     }
 
     /// Returns a mutable reference to the `HeaderValue` corresponding to
@@ -1315,6 +1334,31 @@ mod ut_headers {
                 inner: [b"text/html, application/xhtml+xml, application/xml".to_vec()].to_vec(),
                 is_sensitive: false
             }
+        );
+    }
+
+    /// UT test cases for `Headers::get_lowercase`.
+    ///
+    /// # Brief
+    /// 1. Creates a `Headers` with a mixed-case field name.
+    /// 2. Fetches it through the lowercase hot-path lookup.
+    /// 3. Checks that the normal `get` path still handles mixed-case input.
+    #[test]
+    fn ut_headers_get_lowercase() {
+        let mut headers = Headers::new();
+        headers.append("Content-Length", "42").unwrap();
+
+        assert_eq!(
+            headers
+                .get_lowercase("content-length")
+                .unwrap()
+                .to_string()
+                .unwrap(),
+            "42"
+        );
+        assert_eq!(
+            headers.get("Content-Length").unwrap().to_string().unwrap(),
+            "42"
         );
     }
 

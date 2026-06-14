@@ -2465,3 +2465,24 @@ trace-summary 仍显示 `request_pending_gap_p99_us=36610`、`request_pending_ga
 - `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
 
 结论：保留该改动作为 benchmark fairness/perf cleanup：它减少 ylong 自身起跑分发噪声，使 ylong/libcurl 的 start-delay max avg 接近（2.344ms vs 2.421ms）。但 strict CONNECT 仍只有 +8.589%、0/3 passes、formal_pass=false，且 ylong p99 仍弱于 libcurl，所以目标仍未完成。后续主线应继续追 request/response body pending gap 和 runtime I/O wake，而不是再调起跑门闩。
+
+补充 fixed header lowercase lookup fast path：`Headers::get` 会为每次查询构造并规范化一个临时 `HeaderName`；HTTP/1 和 HTTP/2 连接路径里有多处固定字段名查询，字段名在源码中已经是规范 lowercase。此次给 `HeaderName` 增加 `Borrow<str>`，并新增 `Headers::get_lowercase`，让这些固定 lowercase 字段名直接走 `HashMap` borrowed lookup，避免每次响应/请求路径上的临时 `HeaderName` 分配和 lowercase 扫描。已替换的固定字段包括 `accept`、`transfer-encoding`、`content-length`、`connection`、`trailer` 和 `te`。用户允许使用 `unsafe`，但本轮没有新增 unsafe：这里的收益来自现有数据结构的 borrowed lookup；parser 里已有的 unsafe 边界已经覆盖更低层的字节构造场景。
+
+同一 native HTTPS-over-HTTPS-proxy fixture，`requests=128`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`read_buffer_size=64 KiB`、`--phase-summary`：
+
+| Client experiment | repeats | ylong avg rps | libcurl avg rps | 平均提升 | passes | formal_pass | ylong p99 avg | libcurl p99 avg | max/min 提升 | 日志 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| fixed lowercase header lookup | 3 | 3185.941 | 3017.661 | +5.700% | 0/3 | false | 32.868ms | 29.298ms | +8.173% / +3.775% | `target/https_proxy_bench/strict_header_lookup_repeat3.log` |
+
+验证：
+
+- `rustfmt --check ylong_http/src/headers.rs ylong_http_client/src/util/normalizer.rs ylong_http_client/src/async_impl/conn/http1.rs ylong_http_client/src/sync_impl/conn/http1.rs ylong_http_client/src/async_impl/conn/http2.rs` passed with existing rustfmt-config warnings.
+- `cargo test -p ylong_http ut_headers_get_lowercase --features http1_1 -- --nocapture` passed.
+- `cargo test -p ylong_http_client ut_body_length_parser --features "async http1_1 ylong_base" -- --nocapture` passed with existing warnings.
+- `cargo test -p ylong_http_client ut_request_body_encoding --features "async http1_1 ylong_base" -- --nocapture` passed with existing warnings.
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings.
+- `git diff --check` passed.
+
+结论：保留该改动作为通用 header lookup hot-path cleanup；它删除固定字段查询中的小分配和规范化开销，并保持 mixed-case/user-provided 查询继续使用原 `get` 路径。但 strict CONNECT repeat3 仍只有 +5.700%、0/3 passes、formal_pass=false，不能作为 20%+ completion path。主缺口仍在 ylong_runtime I/O wake、task resume 和 worker queue tail，而不是固定 header lookup 本身。

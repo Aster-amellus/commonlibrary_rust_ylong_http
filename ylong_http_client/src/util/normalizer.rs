@@ -43,7 +43,7 @@ impl<'a, T> RequestFormatter<'a, T> {
 
         let host_value = format_host_value(self.part.uri())?;
 
-        if self.part.headers_mut().get("Accept").is_none() {
+        if self.part.headers_mut().get_lowercase("accept").is_none() {
             let _ = self.part.headers_mut().insert("Accept", "*/*");
         }
 
@@ -154,7 +154,7 @@ impl<'a> BodyLengthParser<'a> {
 
         #[cfg(feature = "http1_1")]
         {
-            let transfer_encoding = self.part.headers.get("Transfer-Encoding");
+            let transfer_encoding = self.part.headers.get_lowercase("transfer-encoding");
 
             if transfer_encoding.is_some() {
                 if self.part.version == Version::HTTP1_0 {
@@ -171,7 +171,7 @@ impl<'a> BodyLengthParser<'a> {
             }
         }
 
-        let content_length = self.part.headers.get("Content-Length");
+        let content_length = self.part.headers.get_lowercase("content-length");
 
         if content_length.is_some() {
             let content_length_valid = content_length.and_then(header_value_to_u64);
