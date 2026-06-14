@@ -578,8 +578,12 @@ impl Chunk {
             .decode(buf)
             .map_err(|e| HttpClientError::from_error(ErrorKind::BodyDecode, e))?;
 
+        let start = buf.as_ptr() as usize;
         let mut finished = false;
-        let mut ptrs = Vec::new();
+        // Most socket reads contain one decoded data chunk. Keep that range
+        // inline so the common path does not allocate a Vec for every body read.
+        let mut first_range = None;
+        let mut ranges = Vec::new();
 
         for chunk in chunks.into_iter() {
             if chunk.trailer().is_some() {
@@ -592,7 +596,15 @@ impl Chunk {
                     break;
                 }
                 let data = chunk.data();
-                ptrs.push((data.as_ptr(), data.len()))
+                let range = (data.as_ptr() as usize - start, data.len());
+                if let Some(first) = first_range {
+                    if ranges.is_empty() {
+                        ranges.push(first);
+                    }
+                    ranges.push(range);
+                } else {
+                    first_range = Some(range);
+                }
             }
         }
 
@@ -600,14 +612,23 @@ impl Chunk {
             return err_from_msg!(BodyDecode, "Invalid chunk body");
         }
 
-        let start = buf.as_ptr();
-
         let mut idx = 0;
-        for (ptr, len) in ptrs.into_iter() {
-            let st = ptr as usize - start as usize;
-            let ed = st + len;
-            buf.copy_within(st..ed, idx);
-            idx += len;
+        if ranges.is_empty() {
+            if let Some((st, len)) = first_range {
+                let ed = st + len;
+                if st != idx {
+                    buf.copy_within(st..ed, idx);
+                }
+                idx += len;
+            }
+        } else {
+            for (st, len) in ranges.into_iter() {
+                let ed = st + len;
+                if st != idx {
+                    buf.copy_within(st..ed, idx);
+                }
+                idx += len;
+            }
         }
         Ok((idx, finished))
     }

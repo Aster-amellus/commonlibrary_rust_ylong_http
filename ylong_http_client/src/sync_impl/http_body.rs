@@ -283,8 +283,12 @@ impl Chunk {
             .decode(buf)
             .map_err(|e| HttpClientError::from_error(ErrorKind::BodyDecode, e))?;
 
+        let start = buf.as_ptr() as usize;
         let mut finished = false;
-        let mut ptrs = Vec::new();
+        // Most socket reads contain one decoded data chunk. Keep that range
+        // inline so the common path does not allocate a Vec for every body read.
+        let mut first_range = None;
+        let mut ranges = Vec::new();
         for chunk in chunks.into_iter() {
             if chunk.trailer().is_some() {
                 if chunk.state() == &ChunkState::Finish {
@@ -296,7 +300,15 @@ impl Chunk {
                     break;
                 }
                 let data = chunk.data();
-                ptrs.push((data.as_ptr(), data.len()))
+                let range = (data.as_ptr() as usize - start, data.len());
+                if let Some(first) = first_range {
+                    if ranges.is_empty() {
+                        ranges.push(first);
+                    }
+                    ranges.push(range);
+                } else {
+                    first_range = Some(range);
+                }
             }
         }
 
@@ -307,14 +319,23 @@ impl Chunk {
             ));
         }
 
-        let start = buf.as_ptr();
-
         let mut idx = 0;
-        for (ptr, len) in ptrs.into_iter() {
-            let st = ptr as usize - start as usize;
-            let ed = st + len;
-            buf.copy_within(st..ed, idx);
-            idx += len;
+        if ranges.is_empty() {
+            if let Some((st, len)) = first_range {
+                let ed = st + len;
+                if st != idx {
+                    buf.copy_within(st..ed, idx);
+                }
+                idx += len;
+            }
+        } else {
+            for (st, len) in ranges.into_iter() {
+                let ed = st + len;
+                if st != idx {
+                    buf.copy_within(st..ed, idx);
+                }
+                idx += len;
+            }
         }
         Ok((idx, finished))
     }
@@ -370,5 +391,24 @@ mod ut_syn_http_body {
             body.data(&mut buf).unwrap_err().error_kind(),
             ErrorKind::BodyDecode
         );
+    }
+
+    #[test]
+    fn ut_http_body_chunk_merges_data() {
+        let chunk_body = "\
+            5\r\n\
+            hello\r\n\
+            C\r\n\
+            hello world!\r\n\
+            0\r\n\r\n\
+            ";
+        let mut body = HttpBody::chunk(chunk_body.as_bytes(), Box::new("".as_bytes()), false);
+        let mut buf = [0u8; 32];
+
+        let read = body.data(&mut buf).unwrap();
+        assert_eq!(read, 17);
+        assert_eq!(&buf[..read], b"hellohello world!");
+
+        assert_eq!(body.data(&mut buf).unwrap(), 0);
     }
 }
