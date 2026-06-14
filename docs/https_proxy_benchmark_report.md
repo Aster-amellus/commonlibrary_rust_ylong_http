@@ -2486,3 +2486,20 @@ trace-summary 仍显示 `request_pending_gap_p99_us=36610`、`request_pending_ga
 - `git diff --check` passed.
 
 结论：保留该改动作为通用 header lookup hot-path cleanup；它删除固定字段查询中的小分配和规范化开销，并保持 mixed-case/user-provided 查询继续使用原 `get` 路径。但 strict CONNECT repeat3 仍只有 +5.700%、0/3 passes、formal_pass=false，不能作为 20%+ completion path。主缺口仍在 ylong_runtime I/O wake、task resume 和 worker queue tail，而不是固定 header lookup 本身。
+
+补充 fixed-length body read clamp 负实验：为验证 `Content-Length` body 在最后一次读取时是否因传入完整用户 buffer 而过读，临时将 async `HttpBody::Text` 底层 `ReadBuf` 限制为 `remaining` 字节，并调整测试让底层流里的 `Content-Length` 后多余字节留给连接后续读取。该改动已撤回。
+
+撤回原因：
+
+- strict CONNECT 没有性能收益：同一 native HTTPS-over-HTTPS-proxy fixture 下，`requests=128`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`read_buffer_size=64 KiB`、`REPEAT=3`、`--phase-summary` 的日志 `target/https_proxy_bench/strict_text_remaining_clamp_repeat3.log` 显示 ylong 平均 3005.820 rps、libcurl 平均 3004.080 rps，平均提升 +0.008%，`passes=0/3`、`formal_pass=false`。
+- 行为边界变差：当前 HTTP/1 客户端不做 pipelining；底层流在 `Content-Length` 后仍有额外字节更接近脏连接/协议违规。原实现会在当前 body 读阶段发现 `filled > remaining` 并返回 `BodyDecode`，撤回后的测试继续覆盖这个错误路径。clamp 会把这类脏字节留到下一次连接复用时才暴露，不适合作为默认行为。
+
+临时 patch 期间已验证：
+
+- `rustfmt --check ylong_http_client/src/async_impl/http_body.rs`
+- `cargo test -p ylong_http_client --features "async http1_1 ylong_base" http_body -- --nocapture`
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"`
+- `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"`
+- `git diff --check`
+
+诊断价值：fixed-length body 的最后一次 slice 长度不是 strict CONNECT 大响应的主瓶颈；保留原有超长 body 立即报错语义更稳妥。后续不要再把 `Text::poll_read_io` 的 remaining clamp 作为性能完成路径，除非同时引入明确的 HTTP/1 pipeline/connection-dirty 语义设计。
