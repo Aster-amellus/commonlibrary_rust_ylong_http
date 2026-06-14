@@ -31,6 +31,23 @@ pub trait ConnInfo {
     fn quic_conn(&mut self) -> Option<QuicConn>;
 }
 
+/// High-level role of the connection transport stack.
+///
+/// This is intentionally coarser than the concrete stream type. Proxy CONNECT
+/// performance work needs a stable place to attach phase and scheduling policy
+/// without matching on connector internals or changing public APIs.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum TransportRole {
+    #[default]
+    DirectHttp,
+    DirectHttps,
+    HttpOverHttpProxy,
+    HttpOverHttpsProxy,
+    HttpsOverHttpProxy,
+    HttpsOverHttpsProxy,
+}
+
 /// Tcp connection information.
 #[derive(Clone)]
 pub struct ConnDetail {
@@ -93,6 +110,8 @@ pub struct ConnData {
     negotiate: NegotiateInfo,
     proxy: bool,
     proxy_auth: Option<String>,
+    #[allow(dead_code)]
+    transport_role: TransportRole,
     time_group: TimeGroup,
 }
 
@@ -119,6 +138,11 @@ impl ConnData {
         self.proxy_auth.as_deref()
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn transport_role(&self) -> TransportRole {
+        self.transport_role
+    }
+
     pub(crate) fn time_group_mut(&mut self) -> &mut TimeGroup {
         &mut self.time_group
     }
@@ -131,6 +155,7 @@ pub struct ConnDataBuilder {
     negotiate: NegotiateInfo,
     proxy: bool,
     proxy_auth: Option<String>,
+    transport_role: TransportRole,
     time_group: TimeGroup,
 }
 
@@ -153,6 +178,12 @@ impl ConnDataBuilder {
         self
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn transport_role(mut self, role: TransportRole) -> Self {
+        self.transport_role = role;
+        self
+    }
+
     /// Set the time required for each phase of connection establishment.
     pub fn time_group(mut self, time_group: TimeGroup) -> Self {
         self.time_group = time_group;
@@ -167,7 +198,41 @@ impl ConnDataBuilder {
             negotiate: self.negotiate,
             proxy: self.proxy,
             proxy_auth: self.proxy_auth,
+            transport_role: self.transport_role,
             time_group: self.time_group,
         }
+    }
+}
+
+#[cfg(test)]
+mod ut_conn_data {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use crate::ConnProtocol;
+
+    use super::{ConnData, ConnDetail, TransportRole};
+
+    fn detail() -> ConnDetail {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80);
+        ConnDetail {
+            protocol: ConnProtocol::Tcp,
+            local: addr,
+            peer: addr,
+            addr: "127.0.0.1:80".to_string(),
+        }
+    }
+
+    #[test]
+    fn ut_conn_data_transport_role_default() {
+        let data = ConnData::builder().build(detail());
+        assert_eq!(data.transport_role(), TransportRole::DirectHttp);
+    }
+
+    #[test]
+    fn ut_conn_data_transport_role_setter() {
+        let data = ConnData::builder()
+            .transport_role(TransportRole::HttpsOverHttpsProxy)
+            .build(detail());
+        assert_eq!(data.transport_role(), TransportRole::HttpsOverHttpsProxy);
     }
 }

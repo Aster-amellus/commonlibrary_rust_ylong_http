@@ -213,6 +213,7 @@ mod no_tls {
     use crate::util::config::HttpVersion;
     use crate::util::interceptor::ConnProtocol;
     use crate::util::pool::PoolKey;
+    use crate::util::TransportRole;
     use crate::{ConnData, ConnDetail, HttpClientError, TimeGroup};
 
     impl Connector for HttpConnector {
@@ -267,6 +268,11 @@ mod no_tls {
                     .time_group(time_group)
                     .proxy(is_proxy)
                     .proxy_auth(auth)
+                    .transport_role(if is_proxy {
+                        TransportRole::HttpOverHttpProxy
+                    } else {
+                        TransportRole::DirectHttp
+                    })
                     .build(detail);
                 Ok(HttpStream::new(stream, data))
             })
@@ -294,6 +300,7 @@ mod tls {
     use crate::util::information::NegotiateInfo;
     use crate::util::interceptor::ConnProtocol;
     use crate::util::pool::PoolKey;
+    use crate::util::TransportRole;
     use crate::{ConnData, ConnDetail, HttpClientError, TimeGroup, TlsConfig};
     use core::future::Future;
     use core::pin::Pin;
@@ -380,10 +387,20 @@ mod tls {
                     } else {
                         MixStream::Http(stream)
                     };
+                    let transport_role = if is_proxy {
+                        if proxy_scheme.as_ref() == Some(&Scheme::HTTPS) {
+                            TransportRole::HttpOverHttpsProxy
+                        } else {
+                            TransportRole::HttpOverHttpProxy
+                        }
+                    } else {
+                        TransportRole::DirectHttp
+                    };
                     let data = ConnData::builder()
                         .time_group(time_group)
                         .proxy(is_proxy)
                         .proxy_auth(auth)
+                        .transport_role(transport_role)
                         .build(detail);
 
                     Ok(HttpStream::new(stream, data))
@@ -431,6 +448,7 @@ mod tls {
                                 let mut data = ConnData::builder()
                                     .time_group(time_group.clone())
                                     .proxy(is_proxy)
+                                    .transport_role(TransportRole::DirectHttps)
                                     .build(detail);
 
                                 let mut stream =
@@ -518,7 +536,8 @@ mod tls {
 
         time_group.set_tls_start(Instant::now());
         let origin_pin_host = format!("{host}:{port}");
-        let stream = if is_proxy && proxy_scheme == Some(Scheme::HTTPS) {
+        let is_https_over_https_proxy = is_proxy && proxy_scheme == Some(Scheme::HTTPS);
+        let stream = if is_https_over_https_proxy {
             let proxy_config = proxy_tls_config.unwrap_or_default();
             let proxy_host = proxy_host.unwrap_or_else(|| addr.clone());
             let proxy_tls = connect_tls_with_read_ahead_buffer(
@@ -547,6 +566,13 @@ mod tls {
                 connect_tls(config, host.as_str(), tcp, origin_pin_host.as_str()).await?;
             MixStream::Https(origin_tls)
         };
+        let transport_role = if is_https_over_https_proxy {
+            TransportRole::HttpsOverHttpsProxy
+        } else if is_proxy {
+            TransportRole::HttpsOverHttpProxy
+        } else {
+            TransportRole::DirectHttps
+        };
         time_group.set_tls_end(Instant::now());
 
         #[cfg(feature = "http2")]
@@ -567,6 +593,7 @@ mod tls {
             .time_group(time_group)
             .proxy(is_proxy)
             .proxy_auth(None)
+            .transport_role(transport_role)
             .negotiate(NegotiateInfo::from_alpn(alpn))
             .build(detail);
 
@@ -575,6 +602,7 @@ mod tls {
             .time_group(time_group)
             .proxy(is_proxy)
             .proxy_auth(None)
+            .transport_role(transport_role)
             .build(detail);
 
         Ok(HttpStream::new(stream, data))

@@ -2523,3 +2523,21 @@ trace-summary 仍显示 `request_pending_gap_p99_us=36610`、`request_pending_ga
 - `git diff --check`
 
 诊断价值：strict CONNECT 大响应不是因为单个 `Text::poll_read_io` 读得太多而落后；继续减小 body read quantum 会把瓶颈推向更多 poll/调度开销。后续不要再沿“更小 response.data buffer / 更小 body drain quantum / yield after body read”方向追主目标，除非 runtime I/O wake 或 worker queue tail 已先被修复。
+
+补充 transport role foundation：上一轮 CONNECT body drain quantum 负实验暴露出一个仍然有价值的边界问题：后续 phase-aware / scheduler policy 需要能区分 direct HTTP(S)、HTTP target over proxy、HTTPS target over HTTP proxy、HTTPS target over HTTPS proxy，但不应在 body/read loop 中反向匹配 connector 细节。本轮只保留一个行为不变的 crate-private `TransportRole` 连接元数据字段，并在 async connector 建连时标记 direct/proxy transport role；没有重新引入 body drain quantum、read buffer cap、yield after body read 或 CONNECT 后 read-ahead 切换策略。
+
+同一 native HTTPS-over-HTTPS-proxy fixture，`requests=128`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`read_buffer_size=64 KiB`、`--phase-summary`：
+
+| Client experiment | repeats | ylong avg rps | libcurl avg rps | 平均提升 | passes | formal_pass | ylong p99 avg | libcurl p99 avg | max/min 提升 | 日志 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| transport role foundation only | 3 | 2878.104 | 2753.635 | +4.530% | 0/3 | false | 35.455ms | 35.245ms | +6.100% / +1.958% | `target/https_proxy_bench/strict_transport_role_foundation_repeat3.log` |
+
+验证：
+
+- `rustfmt --check ylong_http_client/src/util/information.rs ylong_http_client/src/util/mod.rs ylong_http_client/src/async_impl/connector/mod.rs` passed with existing rustfmt-config warnings.
+- `cargo test -p ylong_http_client ut_conn_data_transport_role --features "async http1_1 ylong_base"` passed: 2 tests.
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"` passed with existing warnings.
+- `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"` passed with existing warnings; `target/transport_role_sync_check.log` contains no `TransportRole` / `transport_role` warnings.
+- `git diff --check` passed.
+
+结论：保留该改动作为后续 `TransportPlan` / phase-aware scheduling 的稳定落点，而不是 strict CONNECT +20% 的完成路径。短基准仍为 `0/3` passes、`formal_pass=false`，说明当前主缺口仍在 I/O-ready request/body task resume 和 worker queue tail；任何利用 `TransportRole` 的策略都需要新的独立验证，不能复用已撤回的更小 body quantum 方向。
