@@ -2503,3 +2503,23 @@ trace-summary 仍显示 `request_pending_gap_p99_us=36610`、`request_pending_ga
 - `git diff --check`
 
 诊断价值：fixed-length body 的最后一次 slice 长度不是 strict CONNECT 大响应的主瓶颈；保留原有超长 body 立即报错语义更稳妥。后续不要再把 `Text::poll_read_io` 的 remaining clamp 作为性能完成路径，除非同时引入明确的 HTTP/1 pipeline/connection-dirty 语义设计。
+
+补充 fixed-length CONNECT body drain quantum 负实验：为验证大响应 drain 是否因单个 body poll 占用过久而放大 worker tail，临时给 async 连接元数据增加粗粒度 transport role，并仅对 HTTPS-target-over-HTTPS-proxy 且 `Content-Length >= 256 KiB` 的 body 使用更小 drain quantum：每次 `poll_data` 最多 4 次 ready read、最多 32 KiB。直接 HTTPS 大 body 保持原 64 KiB 用户 buffer 语义。该源码改动已撤回。
+
+撤回原因：
+
+- strict CONNECT 明确回退：同一 native HTTPS-over-HTTPS-proxy fixture 下，`requests=128`、`warmup=64`、`concurrency=64`、`runtime_threads=16`、`read_buffer_size=64 KiB`、`REPEAT=3`、`--phase-summary` 的日志 `target/https_proxy_bench/strict_body_drain_policy_repeat3.log` 显示 ylong 平均 2847.920 rps、libcurl 平均 3105.743 rps，平均提升 -8.174%，`passes=0/3`、`formal_pass=false`。
+- p99 同步变差：ylong p99 avg 38.615ms，libcurl p99 avg 29.476ms。降低单次 poll 的 body quantum 让每个 1 MiB 响应约 32 次 body read，未换来 tail 改善，反而增加调度/轮询次数。
+
+临时 patch 期间已验证：
+
+- `rustfmt --check ylong_http_client/src/util/information.rs ylong_http_client/src/util/mod.rs ylong_http_client/src/async_impl/connector/mod.rs ylong_http_client/src/async_impl/conn/http1.rs ylong_http_client/src/async_impl/http_body.rs`
+- `cargo test -p ylong_http_client ut_http_body_text --features "async http1_1 ylong_base"`
+- `cargo test -p ylong_http_client ut_https_over_https_proxy_large_body_uses_fair_quantum --features "async http1_1 ylong_base"`
+- `cargo test -p ylong_http_client ut_direct_large_body_keeps_full_user_buffer --features "async http1_1 ylong_base"`
+- `cargo check -p ylong_http_client --example async_ylong_https_proxy_bench --features "async http1_1 ylong_base c_openssl_3_0"`
+- `cargo check -p ylong_http_client --example async_https_proxy_bench --features "async http1_1 tokio_base c_openssl_3_0"`
+- `cargo check -p ylong_http_client --example sync_https_proxy_bench --features "sync http1_1 tokio_base c_openssl_3_0"`
+- `git diff --check`
+
+诊断价值：strict CONNECT 大响应不是因为单个 `Text::poll_read_io` 读得太多而落后；继续减小 body read quantum 会把瓶颈推向更多 poll/调度开销。后续不要再沿“更小 response.data buffer / 更小 body drain quantum / yield after body read”方向追主目标，除非 runtime I/O wake 或 worker queue tail 已先被修复。
