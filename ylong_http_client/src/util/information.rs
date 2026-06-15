@@ -12,10 +12,18 @@
 // limitations under the License.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "http3")]
 use crate::async_impl::QuicConn;
 use crate::{ConnProtocol, TimeGroup};
+
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_conn_id() -> u64 {
+    // Relaxed is enough here: the ID is a correlation token, not a memory fence.
+    NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// `ConnDetail` trait, which is used to obtain information about the current
 /// connection.
@@ -132,6 +140,8 @@ impl NegotiateInfo {
 /// Transport layer connection establishment information data.
 #[derive(Clone)]
 pub struct ConnData {
+    #[allow(dead_code)]
+    conn_id: u64,
     detail: ConnDetail,
     #[cfg(feature = "http2")]
     negotiate: NegotiateInfo,
@@ -168,6 +178,11 @@ impl ConnData {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn conn_id(&self) -> u64 {
+        self.conn_id
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn transport_role(&self) -> TransportRole {
         self.transport_role
     }
@@ -189,6 +204,7 @@ impl ConnData {
 /// ConnData's builder, which builds ConnData through cascading calls.
 #[derive(Default)]
 pub struct ConnDataBuilder {
+    conn_id: Option<u64>,
     #[cfg(feature = "http2")]
     negotiate: NegotiateInfo,
     proxy: bool,
@@ -218,6 +234,12 @@ impl ConnDataBuilder {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn conn_id(mut self, conn_id: u64) -> Self {
+        self.conn_id = Some(conn_id);
+        self
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn transport_role(mut self, role: TransportRole) -> Self {
         self.transport_role = role;
         self
@@ -238,6 +260,7 @@ impl ConnDataBuilder {
     /// Construct ConnData by setting the individual endpoint information.
     pub fn build(self, detail: ConnDetail) -> ConnData {
         ConnData {
+            conn_id: self.conn_id.unwrap_or_else(next_conn_id),
             detail,
             #[cfg(feature = "http2")]
             negotiate: self.negotiate,
@@ -272,6 +295,21 @@ mod ut_conn_data {
     fn ut_conn_data_transport_role_default() {
         let data = ConnData::builder().build(detail());
         assert_eq!(data.transport_role(), TransportRole::DirectHttp);
+    }
+
+    #[test]
+    fn ut_conn_data_conn_id_auto_assigns_unique_values() {
+        let first = ConnData::builder().build(detail());
+        let second = ConnData::builder().build(detail());
+        assert_ne!(first.conn_id(), 0);
+        assert_ne!(second.conn_id(), 0);
+        assert_ne!(first.conn_id(), second.conn_id());
+    }
+
+    #[test]
+    fn ut_conn_data_conn_id_setter_overrides_auto_assignment() {
+        let data = ConnData::builder().conn_id(42).build(detail());
+        assert_eq!(data.conn_id(), 42);
     }
 
     #[test]

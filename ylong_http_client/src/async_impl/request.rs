@@ -17,6 +17,7 @@ use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ylong_http::body::async_impl::ReusableReader;
 use ylong_http::body::MultiPartBase;
@@ -28,6 +29,13 @@ use crate::runtime::{AsyncRead, ReadBuf};
 use crate::util::interceptor::InterceptorContext;
 use crate::util::monitor::TimeGroup;
 use crate::util::request::RequestArc;
+
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_request_id() -> u64 {
+    // Relaxed is enough here: the ID only correlates trace events across layers.
+    NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// A structure that represents an HTTP `Request`. It contains a request line,
 /// some HTTP headers and a HTTP body.
@@ -45,6 +53,8 @@ use crate::util::request::RequestArc;
 /// let request = Request::builder().body(Body::empty());
 /// ```
 pub struct Request {
+    #[allow(dead_code)]
+    pub(crate) request_id: u64,
     pub(crate) inner: Req<Body>,
     pub(crate) time_group: TimeGroup,
 }
@@ -72,6 +82,11 @@ impl Request {
 
     pub(crate) fn time_group_mut(&mut self) -> &mut TimeGroup {
         &mut self.time_group
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn request_id(&self) -> u64 {
+        self.request_id
     }
 }
 
@@ -234,6 +249,7 @@ impl RequestBuilder {
             .0
             .body(body)
             .map(|inner| Request {
+                request_id: next_request_id(),
                 inner,
                 time_group: TimeGroup::default(),
             })
@@ -443,6 +459,7 @@ fn poll_read_cursor(
 #[cfg(test)]
 mod ut_client_request {
     use crate::async_impl::{Body, PercentEncoder, RequestBuilder};
+    use crate::util::request::RequestArc;
 
     /// UT test cases for `RequestBuilder::default`.
     ///
@@ -462,6 +479,25 @@ mod ut_client_request {
             .url("http://")
             .body(Body::empty());
         assert!(request.is_err());
+    }
+
+    #[test]
+    fn ut_client_request_id_auto_assigns_unique_values() {
+        let first = RequestBuilder::default().body(Body::empty()).unwrap();
+        let second = RequestBuilder::default().body(Body::empty()).unwrap();
+        assert_ne!(first.request_id(), 0);
+        assert_ne!(second.request_id(), 0);
+        assert_ne!(first.request_id(), second.request_id());
+    }
+
+    #[test]
+    fn ut_client_request_id_survives_request_arc_clone() {
+        let request = RequestBuilder::default().body(Body::empty()).unwrap();
+        let request_id = request.request_id();
+        let mut first = RequestArc::new(request);
+        let mut second = first.clone();
+        assert_eq!(first.ref_mut().request_id(), request_id);
+        assert_eq!(second.ref_mut().request_id(), request_id);
     }
 
     /// UT test cases for `RequestBuilder::body`.
