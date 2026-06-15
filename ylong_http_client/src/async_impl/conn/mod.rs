@@ -26,7 +26,7 @@ use crate::error::HttpClientError;
 use crate::runtime::{AsyncRead, AsyncWrite};
 use crate::util::config::HttpVersion;
 use crate::util::dispatcher::Conn;
-use crate::util::ConnInfo;
+use crate::util::{ConnInfo, TransportPhase, TransportRole};
 
 pub(crate) trait StreamData: AsyncRead {
     fn shutdown(&self);
@@ -34,6 +34,12 @@ pub(crate) trait StreamData: AsyncRead {
     fn is_stream_closable(&self) -> bool;
 
     fn http_version(&self) -> HttpVersion;
+
+    fn transport_role(&mut self) -> TransportRole {
+        TransportRole::DirectHttp
+    }
+
+    fn set_transport_phase(&mut self, _phase: TransportPhase) {}
 }
 
 // TODO: Use structures instead of a function to reuse the io buf.

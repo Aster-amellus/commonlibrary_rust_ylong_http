@@ -33,6 +33,7 @@ use crate::util::dispatcher::http1::Http1Conn;
 use crate::util::information::ConnInfo;
 use crate::util::interceptor::InterceptorContext;
 use crate::util::normalizer::{header_value_contains, BodyLengthParser};
+use crate::util::{TransportPhase, TransportRole};
 use crate::ErrorKind::BodyTransfer;
 
 const TEMP_BUF_SIZE: usize = 16 * 1024;
@@ -62,6 +63,8 @@ where
         .time_group_mut()
         .set_transfer_start(Instant::now());
     let mut guard = conn.cancel_guard();
+    conn.raw_mut()
+        .set_transport_phase(TransportPhase::RequestWrite);
     encode_request_part(
         message.request.ref_mut(),
         &message.interceptor,
@@ -79,6 +82,8 @@ where
         .ref_mut()
         .time_group_mut()
         .set_request_write_end(Instant::now());
+    conn.raw_mut()
+        .set_transport_phase(TransportPhase::FirstByteWait);
     // Decodes response part.
     let (part, pre) = {
         let mut decoder = ResponseDecoder::new();
@@ -127,7 +132,7 @@ fn read_status_line<S>(
     buf: &mut [u8],
 ) -> Poll<Result<usize, HttpClientError>>
 where
-    S: AsyncRead + Sync + Send + Unpin + 'static,
+    S: AsyncRead + ConnInfo + Sync + Send + Unpin + 'static,
 {
     let mut read_buf = ReadBuf::new(buf);
     match Pin::new(conn.raw_mut()).poll_read(cx, &mut read_buf) {
@@ -143,6 +148,8 @@ where
                 return Poll::Ready(err_from_msg!(Request, "Tcp closed"));
             }
             if request.time_group_mut().transfer_end_time().is_none() {
+                conn.raw_mut()
+                    .set_transport_phase(TransportPhase::HeaderDecode);
                 request.time_group_mut().set_transfer_end(Instant::now())
             }
             Poll::Ready(Ok(size))
@@ -415,7 +422,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Http1Conn<S> {
     }
 }
 
-impl<S: AsyncRead + Unpin> StreamData for Http1Conn<S> {
+impl<S: AsyncRead + ConnInfo + Unpin> StreamData for Http1Conn<S> {
     fn shutdown(&self) {
         Self::shutdown(self)
     }
@@ -427,6 +434,14 @@ impl<S: AsyncRead + Unpin> StreamData for Http1Conn<S> {
 
     fn http_version(&self) -> HttpVersion {
         HttpVersion::Http1
+    }
+
+    fn transport_role(&mut self) -> TransportRole {
+        self.raw_mut().conn_data().transport_role()
+    }
+
+    fn set_transport_phase(&mut self, phase: TransportPhase) {
+        self.raw_mut().set_transport_phase(phase);
     }
 }
 

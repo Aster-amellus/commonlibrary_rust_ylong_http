@@ -26,6 +26,14 @@ pub trait ConnInfo {
     /// Gets connection information data.
     fn conn_data(&self) -> ConnData;
 
+    /// Sets the current transport phase when the implementation can persist it.
+    fn set_transport_phase(&mut self, _phase: TransportPhase) {}
+
+    /// Gets the current transport phase.
+    fn transport_phase(&self) -> TransportPhase {
+        self.conn_data().transport_phase()
+    }
+
     /// Gets quic information
     #[cfg(feature = "http3")]
     fn quic_conn(&mut self) -> Option<QuicConn>;
@@ -46,6 +54,25 @@ pub(crate) enum TransportRole {
     HttpOverHttpsProxy,
     HttpsOverHttpProxy,
     HttpsOverHttpsProxy,
+}
+
+/// Coarse runtime phase for a transport stack.
+///
+/// The phase is an internal hint, not public protocol state. It gives the
+/// client and, later, the runtime a stable vocabulary for distinguishing
+/// latency-sensitive first-byte work from bulk body transfer.
+#[doc(hidden)]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TransportPhase {
+    #[default]
+    Connect,
+    RequestWrite,
+    FirstByteWait,
+    HeaderDecode,
+    BodyDrain,
+    BodyDrainSmall,
+    BodyDrainLarge,
 }
 
 /// Tcp connection information.
@@ -112,6 +139,8 @@ pub struct ConnData {
     proxy_auth: Option<String>,
     #[allow(dead_code)]
     transport_role: TransportRole,
+    #[allow(dead_code)]
+    transport_phase: TransportPhase,
     time_group: TimeGroup,
 }
 
@@ -143,6 +172,15 @@ impl ConnData {
         self.transport_role
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn transport_phase(&self) -> TransportPhase {
+        self.transport_phase
+    }
+
+    pub(crate) fn set_transport_phase(&mut self, phase: TransportPhase) {
+        self.transport_phase = phase;
+    }
+
     pub(crate) fn time_group_mut(&mut self) -> &mut TimeGroup {
         &mut self.time_group
     }
@@ -156,6 +194,7 @@ pub struct ConnDataBuilder {
     proxy: bool,
     proxy_auth: Option<String>,
     transport_role: TransportRole,
+    transport_phase: TransportPhase,
     time_group: TimeGroup,
 }
 
@@ -184,6 +223,12 @@ impl ConnDataBuilder {
         self
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn transport_phase(mut self, phase: TransportPhase) -> Self {
+        self.transport_phase = phase;
+        self
+    }
+
     /// Set the time required for each phase of connection establishment.
     pub fn time_group(mut self, time_group: TimeGroup) -> Self {
         self.time_group = time_group;
@@ -199,6 +244,7 @@ impl ConnDataBuilder {
             proxy: self.proxy,
             proxy_auth: self.proxy_auth,
             transport_role: self.transport_role,
+            transport_phase: self.transport_phase,
             time_group: self.time_group,
         }
     }
@@ -210,7 +256,7 @@ mod ut_conn_data {
 
     use crate::ConnProtocol;
 
-    use super::{ConnData, ConnDetail, TransportRole};
+    use super::{ConnData, ConnDetail, TransportPhase, TransportRole};
 
     fn detail() -> ConnDetail {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80);
@@ -234,5 +280,19 @@ mod ut_conn_data {
             .transport_role(TransportRole::HttpsOverHttpsProxy)
             .build(detail());
         assert_eq!(data.transport_role(), TransportRole::HttpsOverHttpsProxy);
+    }
+
+    #[test]
+    fn ut_conn_data_transport_phase_default_and_setter() {
+        let mut data = ConnData::builder().build(detail());
+        assert_eq!(data.transport_phase(), TransportPhase::Connect);
+
+        data.set_transport_phase(TransportPhase::FirstByteWait);
+        assert_eq!(data.transport_phase(), TransportPhase::FirstByteWait);
+
+        let data = ConnData::builder()
+            .transport_phase(TransportPhase::BodyDrainLarge)
+            .build(detail());
+        assert_eq!(data.transport_phase(), TransportPhase::BodyDrainLarge);
     }
 }

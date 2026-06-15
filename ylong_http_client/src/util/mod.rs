@@ -62,6 +62,8 @@ pub use config::{CertVerifier, ServerCerts};
 pub use config::{Proxy, ProxyBuilder, Redirect, Retry, SpeedLimit, Timeout};
 #[cfg(all(feature = "async", feature = "ylong_base", feature = "http2"))]
 pub(crate) use h2::{split, Reader, Writer};
+#[doc(hidden)]
+pub use information::TransportPhase;
 #[allow(unused_imports)]
 pub(crate) use information::TransportRole;
 pub use information::{ConnData, ConnDataBuilder, ConnDetail, ConnInfo, NegotiateInfo};

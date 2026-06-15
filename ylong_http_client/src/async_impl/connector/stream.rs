@@ -19,7 +19,7 @@ use std::task::{Context, Poll};
 #[cfg(feature = "http3")]
 use crate::async_impl::quic::QuicConn;
 use crate::runtime::{AsyncRead, AsyncWrite, ReadBuf};
-use crate::util::{ConnData, ConnInfo};
+use crate::util::{ConnData, ConnInfo, TransportPhase};
 
 /// A connection wrapper containing io and io information.
 pub struct HttpStream<T> {
@@ -72,6 +72,14 @@ impl<T> ConnInfo for HttpStream<T> {
 
     fn conn_data(&self) -> ConnData {
         self.conn_data.clone()
+    }
+
+    fn set_transport_phase(&mut self, phase: TransportPhase) {
+        self.conn_data.set_transport_phase(phase);
+    }
+
+    fn transport_phase(&self) -> TransportPhase {
+        self.conn_data.transport_phase()
     }
 
     #[cfg(feature = "http3")]

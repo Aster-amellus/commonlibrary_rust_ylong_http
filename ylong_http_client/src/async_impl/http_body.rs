@@ -27,9 +27,68 @@ use crate::runtime::{AsyncRead, ReadBuf, Sleep};
 use crate::util::config::HttpVersion;
 use crate::util::interceptor::InterceptorContext;
 use crate::util::normalizer::BodyLength;
+use crate::util::{TransportPhase, TransportRole};
 
 const TRAILER_SIZE: usize = 1024;
 const BODY_READY_DRAIN_READS: usize = 8;
+const TLS_RECORD_PLAINTEXT: usize = 16 * 1024;
+const CONNECT_SMALL_BODY: u64 = 64 * 1024;
+const CONNECT_LARGE_BODY: u64 = 256 * 1024;
+const UNLIMITED_BODY_BYTES: usize = usize::MAX;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BodyDrainPolicy {
+    max_ready_reads: usize,
+    max_bytes_per_poll: usize,
+    phase: TransportPhase,
+}
+
+impl BodyDrainPolicy {
+    fn default_body() -> Self {
+        Self {
+            max_ready_reads: BODY_READY_DRAIN_READS,
+            max_bytes_per_poll: UNLIMITED_BODY_BYTES,
+            phase: TransportPhase::BodyDrain,
+        }
+    }
+
+    fn for_body(role: TransportRole, body_length: &BodyLength) -> Self {
+        let BodyLength::Length(len) = body_length else {
+            return Self::default_body();
+        };
+
+        if role != TransportRole::HttpsOverHttpsProxy {
+            return Self::default_body();
+        }
+
+        match *len {
+            0..=CONNECT_SMALL_BODY => Self {
+                phase: TransportPhase::BodyDrainSmall,
+                ..Self::default_body()
+            },
+            CONNECT_LARGE_BODY.. => Self {
+                max_ready_reads: 4,
+                // Two TLS records keeps a large CONNECT body from monopolizing
+                // a worker while still amortizing each nested SSL_read wake.
+                max_bytes_per_poll: 2 * TLS_RECORD_PLAINTEXT,
+                phase: TransportPhase::BodyDrainLarge,
+            },
+            _ => Self {
+                max_ready_reads: 6,
+                max_bytes_per_poll: 4 * TLS_RECORD_PLAINTEXT,
+                phase: TransportPhase::BodyDrain,
+            },
+        }
+    }
+
+    fn allowed_read_len(self, remaining: usize, drained: usize) -> usize {
+        if self.max_bytes_per_poll == UNLIMITED_BODY_BYTES {
+            remaining
+        } else {
+            remaining.min(self.max_bytes_per_poll.saturating_sub(drained))
+        }
+    }
+}
 
 /// `HttpBody` is the body part of the `Response` returned by `Client::request`.
 /// `HttpBody` implements `Body` trait, so users can call related methods to get
@@ -74,9 +133,13 @@ impl HttpBody {
     pub(crate) fn new(
         interceptors: InterceptorContext,
         body_length: BodyLength,
-        io: BoxStreamData,
+        mut io: BoxStreamData,
         pre: &[u8],
     ) -> Result<Self, HttpClientError> {
+        let drain_policy = BodyDrainPolicy::for_body(io.transport_role(), &body_length);
+        if !matches!(body_length, BodyLength::Empty) {
+            io.set_transport_phase(drain_policy.phase);
+        }
         let kind = match body_length {
             BodyLength::Empty => {
                 if !pre.is_empty() {
@@ -86,8 +149,12 @@ impl HttpBody {
                 }
                 Kind::Empty
             }
-            BodyLength::Length(len) => Kind::Text(Text::new(len, pre, io, interceptors)),
-            BodyLength::UntilClose => Kind::UntilClose(UntilClose::new(pre, io, interceptors)),
+            BodyLength::Length(len) => {
+                Kind::Text(Text::new(len, pre, io, interceptors, drain_policy))
+            }
+            BodyLength::UntilClose => {
+                Kind::UntilClose(UntilClose::new(pre, io, interceptors, drain_policy))
+            }
 
             #[cfg(feature = "http1_1")]
             BodyLength::Chunk => Kind::Chunk(Chunk::new(pre, io, interceptors)),
@@ -210,14 +277,21 @@ enum Kind {
 
 struct UntilClose {
     interceptors: InterceptorContext,
+    drain_policy: BodyDrainPolicy,
     pre: Option<Cursor<Vec<u8>>>,
     io: Option<BoxStreamData>,
 }
 
 impl UntilClose {
-    pub(crate) fn new(pre: &[u8], io: BoxStreamData, interceptors: InterceptorContext) -> Self {
+    pub(crate) fn new(
+        pre: &[u8],
+        io: BoxStreamData,
+        interceptors: InterceptorContext,
+        drain_policy: BodyDrainPolicy,
+    ) -> Self {
         Self {
             interceptors,
+            drain_policy,
             pre: (!pre.is_empty()).then_some(Cursor::new(pre.to_vec())),
             io: Some(io),
         }
@@ -258,13 +332,20 @@ impl UntilClose {
         buf: &mut [u8],
     ) -> Poll<Result<usize, HttpClientError>> {
         let mut read = read;
-        for _ in 0..BODY_READY_DRAIN_READS {
+        let mut drained = 0;
+        for _ in 0..self.drain_policy.max_ready_reads {
             if read == buf.len() {
                 self.io = Some(io);
                 return Poll::Ready(Ok(read));
             }
 
-            let mut read_buf = ReadBuf::new(&mut buf[read..]);
+            let len = self
+                .drain_policy
+                .allowed_read_len(buf.len() - read, drained);
+            if len == 0 {
+                break;
+            }
+            let mut read_buf = ReadBuf::new(&mut buf[read..read + len]);
             match Pin::new(&mut io).poll_read(cx, &mut read_buf) {
                 Poll::Ready(Ok(())) => {
                     #[cfg(feature = "ylong_base")]
@@ -285,6 +366,7 @@ impl UntilClose {
                                 .intercept_output(&buf[read..(read + filled)])?;
                         }
                     }
+                    drained += filled;
                     read += filled;
                 }
                 Poll::Pending => {
@@ -308,6 +390,7 @@ impl UntilClose {
 
 struct Text {
     interceptors: InterceptorContext,
+    drain_policy: BodyDrainPolicy,
     remaining: u64,
     pre: Option<Cursor<Vec<u8>>>,
     io: Option<BoxStreamData>,
@@ -319,9 +402,11 @@ impl Text {
         pre: &[u8],
         io: BoxStreamData,
         interceptors: InterceptorContext,
+        drain_policy: BodyDrainPolicy,
     ) -> Self {
         Self {
             interceptors,
+            drain_policy,
             remaining: len,
             pre: (!pre.is_empty()).then_some(Cursor::new(pre.to_vec())),
             io: Some(io),
@@ -400,13 +485,20 @@ impl Text {
         read: usize,
     ) -> Poll<Result<usize, HttpClientError>> {
         let mut read = read;
-        for _ in 0..BODY_READY_DRAIN_READS {
+        let mut drained = 0;
+        for _ in 0..self.drain_policy.max_ready_reads {
             if read == buf.len() {
                 self.io = Some(io);
                 return Poll::Ready(Ok(read));
             }
 
-            let mut read_buf = ReadBuf::new(&mut buf[read..]);
+            let len = self
+                .drain_policy
+                .allowed_read_len(buf.len() - read, drained);
+            if len == 0 {
+                break;
+            }
+            let mut read_buf = ReadBuf::new(&mut buf[read..read + len]);
             match Pin::new(&mut io).poll_read(cx, &mut read_buf) {
                 // Disconnected.
                 Poll::Ready(Ok(())) => {
@@ -426,6 +518,7 @@ impl Text {
                         self.interceptors
                             .intercept_output(&buf[read..(read + filled)])?;
                     }
+                    drained += filled;
                     read += filled;
                     match self.consume(filled) {
                         Ok(true) => {
@@ -639,10 +732,63 @@ impl Chunk {
 mod ut_async_http_body {
     use ylong_http::body::async_impl;
 
+    use super::{
+        BodyDrainPolicy, BODY_READY_DRAIN_READS, CONNECT_LARGE_BODY, CONNECT_SMALL_BODY,
+        TLS_RECORD_PLAINTEXT, UNLIMITED_BODY_BYTES,
+    };
     use crate::async_impl::HttpBody;
     use crate::util::interceptor::InterceptorContext;
     use crate::util::normalizer::BodyLength;
+    use crate::util::{TransportPhase, TransportRole};
     use crate::ErrorKind;
+
+    #[test]
+    fn ut_body_drain_policy_keeps_default_paths_unbounded() {
+        let policy =
+            BodyDrainPolicy::for_body(TransportRole::DirectHttps, &BodyLength::Length(1024 * 1024));
+
+        assert_eq!(policy.max_ready_reads, BODY_READY_DRAIN_READS);
+        assert_eq!(policy.max_bytes_per_poll, UNLIMITED_BODY_BYTES);
+        assert_eq!(policy.phase, TransportPhase::BodyDrain);
+    }
+
+    #[test]
+    fn ut_body_drain_policy_marks_small_connect_body() {
+        let policy = BodyDrainPolicy::for_body(
+            TransportRole::HttpsOverHttpsProxy,
+            &BodyLength::Length(CONNECT_SMALL_BODY),
+        );
+
+        assert_eq!(policy.max_ready_reads, BODY_READY_DRAIN_READS);
+        assert_eq!(policy.max_bytes_per_poll, UNLIMITED_BODY_BYTES);
+        assert_eq!(policy.phase, TransportPhase::BodyDrainSmall);
+    }
+
+    #[test]
+    fn ut_body_drain_policy_limits_medium_connect_body() {
+        let policy = BodyDrainPolicy::for_body(
+            TransportRole::HttpsOverHttpsProxy,
+            &BodyLength::Length(CONNECT_SMALL_BODY + 1),
+        );
+
+        assert_eq!(policy.max_ready_reads, 6);
+        assert_eq!(policy.max_bytes_per_poll, 4 * TLS_RECORD_PLAINTEXT);
+        assert_eq!(policy.phase, TransportPhase::BodyDrain);
+    }
+
+    #[test]
+    fn ut_body_drain_policy_limits_large_connect_body() {
+        let policy = BodyDrainPolicy::for_body(
+            TransportRole::HttpsOverHttpsProxy,
+            &BodyLength::Length(CONNECT_LARGE_BODY),
+        );
+
+        assert_eq!(policy.max_ready_reads, 4);
+        assert_eq!(policy.max_bytes_per_poll, 2 * TLS_RECORD_PLAINTEXT);
+        assert_eq!(policy.phase, TransportPhase::BodyDrainLarge);
+        assert_eq!(policy.allowed_read_len(128 * 1024, 0), 32 * 1024);
+        assert_eq!(policy.allowed_read_len(128 * 1024, 16 * 1024), 16 * 1024);
+    }
 
     /// UT test cases for `HttpBody::trailer`.
     ///
