@@ -13,7 +13,7 @@
 
 use std::io::{Read, Write};
 
-use ylong_http::request::uri::Uri;
+use ylong_http::request::uri::{Authority, Scheme, Uri};
 
 use crate::util::config::ConnectorConfig;
 
@@ -27,6 +27,12 @@ pub trait Connector {
 
     /// Attempts to establish a synchronous connection.
     fn connect(&self, uri: &Uri) -> Result<Self::Stream, Self::Error>;
+
+    /// Returns proxy identity used by the connection pool.
+    #[doc(hidden)]
+    fn proxy_pool_key(&self, _uri: &Uri) -> Option<(u64, Scheme, Authority)> {
+        None
+    }
 }
 
 /// Connector for creating HTTP connections synchronously.
@@ -41,6 +47,10 @@ impl HttpConnector {
     pub(crate) fn new(config: ConnectorConfig) -> HttpConnector {
         HttpConnector { config }
     }
+
+    fn proxy_pool_key_for(&self, uri: &Uri) -> Option<(u64, Scheme, Authority)> {
+        self.config.proxies.proxy_pool_key(uri)
+    }
 }
 
 impl Default for HttpConnector {
@@ -54,13 +64,17 @@ pub mod no_tls {
     use std::io::Error;
     use std::net::TcpStream;
 
-    use ylong_http::request::uri::Uri;
+    use ylong_http::request::uri::{Authority, Scheme, Uri};
 
     use crate::sync_impl::Connector;
 
     impl Connector for super::HttpConnector {
         type Stream = TcpStream;
         type Error = Error;
+
+        fn proxy_pool_key(&self, uri: &Uri) -> Option<(u64, Scheme, Authority)> {
+            self.proxy_pool_key_for(uri)
+        }
 
         fn connect(&self, uri: &Uri) -> Result<Self::Stream, Self::Error> {
             let addr = if let Some(proxy) = self.config.proxies.match_proxy(uri) {
@@ -78,7 +92,7 @@ pub mod tls_conn {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    use ylong_http::request::uri::{Scheme, Uri};
+    use ylong_http::request::uri::{Authority, Scheme, Uri};
 
     use crate::sync_impl::{Connector, MixStream};
     use crate::{ErrorKind, HttpClientError};
@@ -86,6 +100,10 @@ pub mod tls_conn {
     impl Connector for super::HttpConnector {
         type Stream = MixStream<TcpStream>;
         type Error = HttpClientError;
+
+        fn proxy_pool_key(&self, uri: &Uri) -> Option<(u64, Scheme, Authority)> {
+            self.proxy_pool_key_for(uri)
+        }
 
         fn connect(&self, uri: &Uri) -> Result<Self::Stream, Self::Error> {
             // Make sure all parts of uri is accurate.

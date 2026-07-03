@@ -448,6 +448,32 @@ impl ProxyBuilder {
         self
     }
 
+    /// Sets TLS configuration used when connecting to an HTTPS proxy server.
+    ///
+    /// This option is used by the asynchronous client HTTPS proxy transport and
+    /// does not affect TLS configuration for the final origin server.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ylong_http_client::{Proxy, TlsConfig};
+    ///
+    /// let proxy_tls = TlsConfig::builder().build().unwrap();
+    /// let builder = Proxy::all("https://example.com").proxy_tls_config(proxy_tls);
+    /// ```
+    #[cfg(feature = "__tls")]
+    pub fn proxy_tls_config(mut self, tls_config: crate::util::TlsConfig) -> Self {
+        self.inner = self.inner.map(|mut proxy| {
+            match &mut proxy.intercept {
+                proxy::Intercept::All(info)
+                | proxy::Intercept::Http(info)
+                | proxy::Intercept::Https(info) => info.tls_config = Some(tls_config),
+            }
+            proxy
+        });
+        self
+    }
+
     /// Constructs a `Proxy`.
     ///
     /// # Examples
@@ -466,6 +492,8 @@ impl ProxyBuilder {
 mod ut_settings {
     use std::time::Duration;
 
+    #[cfg(feature = "__tls")]
+    use ylong_http::request::uri::Scheme;
     use ylong_http::request::uri::Uri;
 
     use crate::{Proxy, Redirect, Retry, SpeedLimit, Timeout};
@@ -612,5 +640,29 @@ mod ut_settings {
         let proxy = Proxy::https("http://127.0.0.1:6789").build().unwrap();
         let uri = Uri::from_bytes(b"https://127.0.0.1:3456").unwrap();
         assert!(proxy.inner().is_intercepted(&uri));
+    }
+
+    /// UT test cases for `ProxyBuilder::proxy_tls_config`.
+    ///
+    /// # Brief
+    /// 1. Creates a HTTPS proxy endpoint.
+    /// 2. Sets TLS configuration for the proxy server.
+    /// 3. Checks if the proxy scheme and TLS configuration are stored.
+    #[cfg(feature = "__tls")]
+    #[test]
+    fn ut_proxy_https_tls_config() {
+        let tls = crate::util::TlsConfig::builder()
+            .danger_accept_invalid_hostnames(true)
+            .build()
+            .unwrap();
+        let proxy = Proxy::https("https://127.0.0.1:6789")
+            .proxy_tls_config(tls)
+            .build()
+            .unwrap()
+            .inner();
+        let info = proxy.intercept.proxy_info();
+
+        assert_eq!(info.scheme(), &Scheme::HTTPS);
+        assert!(info.tls_config.is_some());
     }
 }

@@ -40,6 +40,8 @@ mod ssl_stream;
 #[cfg(feature = "__tls")]
 pub(crate) mod mix;
 
+pub(crate) mod proxy;
+
 pub(crate) mod conn;
 pub(crate) mod pool;
 #[cfg(feature = "http3")]

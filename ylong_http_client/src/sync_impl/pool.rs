@@ -22,6 +22,7 @@ use crate::error::{ErrorKind, HttpClientError};
 use crate::sync_impl::Connector;
 use crate::util::dispatcher::{Conn, ConnDispatcher, Dispatcher};
 use crate::util::pool::{Pool, PoolKey};
+use crate::util::progress::SpeedConfig;
 
 pub(crate) struct ConnPool<C, S> {
     pool: Pool<PoolKey, Conns<S>>,
@@ -37,13 +38,21 @@ impl<C: Connector> ConnPool<C, C::Stream> {
     }
 
     pub(crate) fn connect_to(&self, uri: Uri) -> Result<Conn<C::Stream>, HttpClientError> {
-        let key = PoolKey::new(
-            uri.scheme().unwrap().clone(),
-            uri.authority().unwrap().clone(),
-        );
+        let target_scheme = uri.scheme().unwrap().clone();
+        let target_authority = uri.authority().unwrap().clone();
+        let key = match self.connector.proxy_pool_key(&uri) {
+            Some((proxy_id, proxy_scheme, proxy_authority)) => PoolKey::proxied(
+                target_scheme,
+                target_authority,
+                proxy_id,
+                proxy_scheme,
+                proxy_authority,
+            ),
+            None => PoolKey::new(target_scheme, target_authority),
+        };
 
         self.pool
-            .get(key, Conns::new)
+            .get(key, |_, _| Conns::new(), 0, SpeedConfig::none())
             .conn(|| self.connector.clone().connect(&uri))
     }
 }

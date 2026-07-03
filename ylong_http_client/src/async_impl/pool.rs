@@ -69,10 +69,18 @@ impl<C: Connector> ConnPool<C, C::Stream> {
         &self,
         uri: &Uri,
     ) -> Result<TimeInfoConn<C::Stream>, HttpClientError> {
-        let key = PoolKey::new(
-            uri.scheme().unwrap().clone(),
-            uri.authority().unwrap().clone(),
-        );
+        let target_scheme = uri.scheme().unwrap().clone();
+        let target_authority = uri.authority().unwrap().clone();
+        let key = match self.connector.proxy_pool_key(uri) {
+            Some((proxy_id, proxy_scheme, proxy_authority)) => PoolKey::proxied(
+                target_scheme,
+                target_authority,
+                proxy_id,
+                proxy_scheme,
+                proxy_authority,
+            ),
+            None => PoolKey::new(target_scheme, target_authority),
+        };
 
         #[cfg(feature = "http3")]
         let alt_svc = self.alt_svcs.get_alt_svcs(&key);

@@ -21,9 +21,9 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "ylong_base", feature = "__tls"))]
 use libc::{gid_t, uid_t};
-use ylong_http::request::uri::Uri;
+use ylong_http::request::uri::{Authority, Scheme, Uri};
 #[cfg(feature = "http3")]
 use ylong_runtime::net::{ConnectedUdpSocket, UdpSocket};
 
@@ -49,6 +49,12 @@ pub trait Connector {
 
     /// Attempts to establish a connection.
     fn connect(&self, uri: &Uri, http_version: HttpVersion) -> Self::Future;
+
+    /// Returns proxy identity used by the connection pool.
+    #[doc(hidden)]
+    fn proxy_pool_key(&self, _uri: &Uri) -> Option<(u64, Scheme, Authority)> {
+        None
+    }
 }
 
 /// Connector for creating HTTP or HTTPS connections asynchronously.
@@ -63,6 +69,10 @@ impl HttpConnector {
     /// Creates a new `HttpConnector` with a `ConnectorConfig`.
     pub(crate) fn new(config: ConnectorConfig, resolver: Arc<dyn Resolver>) -> Self {
         Self { config, resolver }
+    }
+
+    fn proxy_pool_key_for(&self, uri: &Uri) -> Option<(u64, Scheme, Authority)> {
+        crate::async_impl::proxy::ProxyRoute::resolve(&self.config.proxies, uri).pool_key()
     }
 
     /// Creates a new `HttpConnector` with a given dns `Resolver`.
@@ -191,11 +201,12 @@ mod no_tls {
     use core::pin::Pin;
     use std::time::Instant;
 
-    use ylong_http::request::uri::Uri;
+    use ylong_http::request::uri::{Authority, Scheme, Uri};
 
     use super::{eyeballs_connect, Connector, HttpConnector};
     use crate::async_impl::connector::dns_query;
     use crate::async_impl::connector::stream::HttpStream;
+    use crate::async_impl::proxy::ProxyRoute;
     use crate::runtime::TcpStream;
     use crate::util::config::HttpVersion;
     use crate::util::interceptor::ConnProtocol;
@@ -206,18 +217,21 @@ mod no_tls {
         type Future =
             Pin<Box<dyn Future<Output = Result<Self::Stream, HttpClientError>> + Sync + Send>>;
 
+        fn proxy_pool_key(&self, uri: &Uri) -> Option<(u64, Scheme, Authority)> {
+            self.proxy_pool_key_for(uri)
+        }
+
         fn connect(&self, uri: &Uri, _http_version: HttpVersion) -> Self::Future {
-            // Checks if this uri need be proxied.
-            let mut is_proxy = false;
-            let mut addr = uri.authority().unwrap().to_string();
-            if let Some(proxy) = self.config.proxies.match_proxy(uri) {
-                addr = proxy.via_proxy(uri).authority().unwrap().to_string();
-                is_proxy = true;
-            }
+            let route = ProxyRoute::resolve(&self.config.proxies, uri);
+            let addr = route.next_hop_authority(uri).to_string();
+            let auth = route.proxy_auth();
+            let is_proxy = route.is_proxied();
 
             let resolver = self.resolver.clone();
             let timeout = self.config.timeout.clone();
             Box::pin(async move {
+                route.ensure_supported()?;
+
                 let mut time_group = TimeGroup::default();
                 time_group.set_dns_start(Instant::now());
                 let socket_addrs = dns_query(resolver, addr.as_str()).await?;
@@ -241,6 +255,7 @@ mod no_tls {
                 let data = ConnData::builder()
                     .time_group(time_group)
                     .proxy(is_proxy)
+                    .proxy_auth(auth)
                     .build(detail);
                 Ok(HttpStream::new(stream, data))
             })
@@ -250,56 +265,51 @@ mod no_tls {
 
 #[cfg(feature = "__tls")]
 mod tls {
-    use core::future::Future;
-    use core::pin::Pin;
-    use std::error;
-    use std::fmt::{Debug, Display, Formatter};
-    use std::io::{Error, ErrorKind, Write};
-    use std::time::Instant;
-    use ylong_http::request::uri::{Scheme, Uri};
-    use super::{eyeballs_connect, Connector, HttpConnector};
     #[cfg(all(target_os = "linux", feature = "ylong_base", feature = "__tls"))]
     use super::eyeballs_connect_with_owner;
+    use super::{eyeballs_connect, Connector, HttpConnector};
     use crate::async_impl::connector::dns_query;
     use crate::async_impl::connector::stream::HttpStream;
     use crate::async_impl::mix::MixStream;
+    use crate::async_impl::proxy::ProxyRoute;
     #[cfg(feature = "http3")]
     use crate::async_impl::quic::QuicConn;
-    use crate::async_impl::ssl_stream::AsyncSslStream;
-    use crate::runtime::{AsyncReadExt, AsyncWriteExt, TcpStream};
+    use crate::runtime::TcpStream;
     use crate::util::config::HttpVersion;
     #[cfg(feature = "http2")]
     use crate::util::information::NegotiateInfo;
     use crate::util::interceptor::ConnProtocol;
     use crate::{ConnData, ConnDetail, HttpClientError, TimeGroup, TlsConfig};
+    use core::future::Future;
+    use core::pin::Pin;
+    #[cfg(feature = "http3")]
+    use std::io::{Error, ErrorKind};
+    use std::time::Instant;
+    use ylong_http::request::uri::{Authority, Scheme, Uri};
 
     impl Connector for HttpConnector {
         type Stream = HttpStream<MixStream>;
         type Future =
             Pin<Box<dyn Future<Output = Result<Self::Stream, HttpClientError>> + Sync + Send>>;
 
+        fn proxy_pool_key(&self, uri: &Uri) -> Option<(u64, Scheme, Authority)> {
+            self.proxy_pool_key_for(uri)
+        }
+
         fn connect(&self, uri: &Uri, _http_version: HttpVersion) -> Self::Future {
             // Make sure all parts of uri is accurate.
-            let mut addr = uri.authority().unwrap().to_string();
-            let mut auth = None;
-            let mut is_proxy = false;
-
-            if let Some(proxy) = self.config.proxies.match_proxy(uri) {
-                addr = proxy.via_proxy(uri).authority().unwrap().to_string();
-                auth = proxy
-                    .intercept
-                    .proxy_info()
-                    .basic_auth
-                    .as_ref()
-                    .and_then(|v| v.to_string().ok());
-                is_proxy = true;
-            }
+            let route = ProxyRoute::resolve(&self.config.proxies, uri);
+            let addr = route.next_hop_authority(uri).to_string();
             #[cfg(all(target_os = "linux", feature = "ylong_base", feature = "__tls"))]
             let fchown = self.config.fchown.clone();
             let resolver = self.resolver.clone();
             let timeout = self.config.timeout.clone();
             match *uri.scheme().unwrap() {
                 Scheme::HTTP => Box::pin(async move {
+                    route.ensure_supported()?;
+                    let auth = route.proxy_auth();
+                    let is_proxy = route.is_proxied();
+
                     let mut time_group = TimeGroup::default();
                     time_group.set_dns_start(Instant::now());
                     let socket_addrs = dns_query(resolver, addr.as_str()).await?;
@@ -331,14 +341,18 @@ mod tls {
                         protocol: ConnProtocol::Tcp,
                         local,
                         peer,
-                        addr,
+                        addr: addr.clone(),
                     };
+                    let stream = route
+                        .into_http_stream(stream, addr.as_str(), &mut time_group)
+                        .await?;
                     let data = ConnData::builder()
                         .time_group(time_group)
                         .proxy(is_proxy)
+                        .proxy_auth(auth)
                         .build(detail);
 
-                    Ok(HttpStream::new(MixStream::Http(stream), data))
+                    Ok(HttpStream::new(stream, data))
                 }),
                 Scheme::HTTPS => {
                     let host = uri.host().unwrap().to_string();
@@ -346,6 +360,7 @@ mod tls {
                     let config = self.config.tls.clone();
                     #[cfg(feature = "http3")]
                     if _http_version == HttpVersion::Http3 {
+                        let is_proxy = route.is_proxied();
                         return Box::pin(async move {
                             let mut time_group = TimeGroup::default();
                             time_group.set_dns_start(Instant::now());
@@ -410,13 +425,13 @@ mod tls {
                         let socket_addrs = dns_query(resolver, addr.as_str()).await?;
                         time_group.set_dns_end(Instant::now());
                         time_group.set_tcp_start(Instant::now());
-                        #[cfg(not(all(target_os = "linux", feature = "ylong_base", feature = "__tls")))]
-                        let stream = eyeballs_connect(socket_addrs, timeout).await?;
-                        #[cfg(all(
+                        #[cfg(not(all(
                             target_os = "linux",
                             feature = "ylong_base",
-                            feature = "__tls",
-                        ))]
+                            feature = "__tls"
+                        )))]
+                        let stream = eyeballs_connect(socket_addrs, timeout).await?;
+                        #[cfg(all(target_os = "linux", feature = "ylong_base", feature = "__tls",))]
                         let stream = if let Some(fchown) = fchown {
                             eyeballs_connect_with_owner(
                                 socket_addrs,
@@ -431,15 +446,7 @@ mod tls {
 
                         time_group.set_tcp_end(Instant::now());
 
-                        https_connect(
-                            config,
-                            addr,
-                            stream,
-                            is_proxy,
-                            (auth, host, port),
-                            time_group,
-                        )
-                        .await
+                        https_connect(config, addr, stream, route, (host, port), time_group).await
                     })
                 }
             }
@@ -450,45 +457,36 @@ mod tls {
         config: TlsConfig,
         addr: String,
         tcp_stream: TcpStream,
-        is_proxy: bool,
-        (auth, host, port): (Option<String>, String, u16),
+        route: ProxyRoute,
+        (host, port): (String, u16),
         mut time_group: TimeGroup,
     ) -> Result<HttpStream<MixStream>, HttpClientError> {
-        let mut tcp = tcp_stream;
+        let tcp = tcp_stream;
         let local = tcp
             .local_addr()
             .map_err(|e| HttpClientError::from_io_error(crate::ErrorKind::Connect, e))?;
         let peer = tcp
             .peer_addr()
             .map_err(|e| HttpClientError::from_io_error(crate::ErrorKind::Connect, e))?;
-        if is_proxy {
-            tcp = tunnel(tcp, &host, port, auth)
-                .await
-                .map_err(|e| HttpClientError::from_io_error(crate::ErrorKind::Connect, e))?;
-        };
 
-        let pinned_key = config.pinning_host_match(addr.as_str());
-        let mut stream = config
-            .ssl_new(&host)
-            .and_then(|ssl| AsyncSslStream::new(ssl.into_inner(), tcp, pinned_key))
-            .map_err(|e| {
-                HttpClientError::from_tls_error(
-                    crate::ErrorKind::Connect,
-                    Error::new(ErrorKind::Other, e),
-                )
-            })?;
-
-        time_group.set_tls_start(Instant::now());
-        Pin::new(&mut stream).connect().await.map_err(|e| {
-            HttpClientError::from_tls_error(
-                crate::ErrorKind::Connect,
-                Error::new(ErrorKind::Other, e),
+        let is_proxy = route.is_proxied();
+        let stream = route
+            .into_https_stream(
+                tcp,
+                addr.as_str(),
+                host.as_str(),
+                port,
+                config,
+                &mut time_group,
             )
-        })?;
-        time_group.set_tls_end(Instant::now());
+            .await?;
 
         #[cfg(feature = "http2")]
-        let alpn = stream.negotiated_alpn_protocol().map(Vec::from);
+        let alpn = match &stream {
+            MixStream::Https(stream) => stream.negotiated_alpn_protocol().map(Vec::from),
+            MixStream::HttpsOverProxy(stream) => stream.negotiated_alpn_protocol().map(Vec::from),
+            _ => None,
+        };
         let detail = ConnDetail {
             protocol: ConnProtocol::Tcp,
             local,
@@ -509,350 +507,6 @@ mod tls {
             .proxy(is_proxy)
             .build(detail);
 
-        Ok(HttpStream::new(MixStream::Https(stream), data))
-    }
-
-    async fn tunnel(
-        mut conn: TcpStream,
-        host: &str,
-        port: u16,
-        auth: Option<String>,
-    ) -> Result<TcpStream, Error> {
-        let mut req = Vec::new();
-
-        write!(
-            &mut req,
-            "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
-        )?;
-
-        if let Some(value) = auth {
-            write!(&mut req, "Proxy-Authorization: Basic {value}\r\n")?;
-        }
-
-        write!(&mut req, "\r\n")?;
-
-        conn.write_all(&req).await?;
-
-        let mut buf = [0; 8192];
-        let mut pos = 0;
-
-        loop {
-            let n = conn.read(&mut buf[pos..]).await?;
-
-            if n == 0 {
-                return Err(other_io_error(CreateTunnelErr::Unsuccessful));
-            }
-
-            pos += n;
-            let resp = &buf[..pos];
-            if resp.starts_with(b"HTTP/1.1 200") || resp.starts_with(b"HTTP/1.0 200") {
-                if resp.ends_with(b"\r\n\r\n") {
-                    return Ok(conn);
-                }
-                if pos == buf.len() {
-                    return Err(other_io_error(CreateTunnelErr::ProxyHeadersTooLong));
-                }
-            } else if resp.starts_with(b"HTTP/1.1 407") {
-                return Err(other_io_error(CreateTunnelErr::ProxyAuthenticationRequired));
-            } else {
-                return Err(other_io_error(CreateTunnelErr::Unsuccessful));
-            }
-        }
-    }
-
-    fn other_io_error(err: CreateTunnelErr) -> Error {
-        Error::new(ErrorKind::Other, err)
-    }
-
-    enum CreateTunnelErr {
-        ProxyHeadersTooLong,
-        ProxyAuthenticationRequired,
-        Unsuccessful,
-    }
-
-    impl Debug for CreateTunnelErr {
-        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::ProxyHeadersTooLong => f.write_str("Proxy headers too long for tunnel"),
-                Self::ProxyAuthenticationRequired => f.write_str("Proxy authentication required"),
-                Self::Unsuccessful => f.write_str("Unsuccessful tunnel"),
-            }
-        }
-    }
-
-    impl Display for CreateTunnelErr {
-        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-            Debug::fmt(self, f)
-        }
-    }
-
-    impl error::Error for CreateTunnelErr {}
-
-    #[cfg(all(test, feature = "__tls"))]
-    mod ut_tunnel_error_debug {
-        use crate::async_impl::connector::tls::CreateTunnelErr;
-
-        /// UT test cases for debug of`CreateTunnelErr`.
-        ///
-        /// # Brief
-        /// 1. Checks `CreateTunnelErr` debug by calling `CreateTunnelErr::fmt`.
-        /// 2. Checks if the result is as expected.
-        #[test]
-        fn ut_tunnel_error_debug_assert() {
-            assert_eq!(
-                format!("{:?}", CreateTunnelErr::ProxyHeadersTooLong),
-                "Proxy headers too long for tunnel"
-            );
-            assert_eq!(
-                format!("{:?}", CreateTunnelErr::ProxyAuthenticationRequired),
-                "Proxy authentication required"
-            );
-            assert_eq!(
-                format!("{:?}", CreateTunnelErr::Unsuccessful),
-                "Unsuccessful tunnel"
-            );
-            assert_eq!(
-                format!("{}", CreateTunnelErr::ProxyHeadersTooLong),
-                "Proxy headers too long for tunnel"
-            );
-            assert_eq!(
-                format!("{}", CreateTunnelErr::ProxyAuthenticationRequired),
-                "Proxy authentication required"
-            );
-            assert_eq!(
-                format!("{}", CreateTunnelErr::Unsuccessful),
-                "Unsuccessful tunnel"
-            );
-        }
-    }
-
-    #[cfg(all(test, feature = "__tls", feature = "ylong_base"))]
-    mod ut_create_tunnel_err_debug {
-        use std::net::SocketAddr;
-        use std::str::FromStr;
-
-        use ylong_runtime::io::AsyncWriteExt;
-
-        use crate::async_impl::connector::tcp_stream;
-        use crate::async_impl::connector::tls::{other_io_error, tunnel, CreateTunnelErr};
-        use crate::async_impl::dns::{EyeBallConfig, HappyEyeballs};
-        use crate::start_tcp_server;
-        use crate::util::test_utils::{format_header_str, TcpHandle};
-
-        /// UT test cases for `tunnel`.
-        ///
-        /// # Brief
-        /// 1. Creates a `tcp stream` by calling `tcp_stream`.
-        /// 2. Sends a `Request` by `tunnel`.
-        /// 3. Checks if the result is as expected.
-        #[test]
-        fn ut_ssl_tunnel_error() {
-            let mut handles = vec![];
-            start_tcp_server!(
-               Handles: handles,
-               EndWith: "\r\n\r\n",
-               Shutdown: std::net::Shutdown::Both,
-            );
-            let handle = handles.pop().expect("No more handles !");
-
-            let eyeballs = HappyEyeballs::new(
-                vec![SocketAddr::from_str(handle.addr.as_str()).unwrap()],
-                EyeBallConfig::new(None, None),
-            );
-
-            let handle = ylong_runtime::spawn(async move {
-                let tcp = tcp_stream(eyeballs).await.unwrap();
-                let res = tunnel(
-                    tcp,
-                    "ylong_http.com",
-                    443,
-                    Some(String::from("base64 bytes")),
-                )
-                .await;
-                assert_eq!(
-                    format!("{:?}", res.err()),
-                    format!("{:?}", Some(other_io_error(CreateTunnelErr::Unsuccessful)))
-                );
-                handle
-                    .server_shutdown
-                    .recv()
-                    .expect("server send order failed !");
-            });
-            ylong_runtime::block_on(handle).unwrap();
-
-            start_tcp_server!(
-               Handles: handles,
-               EndWith: "\r\n\r\n",
-               Response: {
-                   Status: 407,
-                   Version: "HTTP/1.1",
-                   Header: "Content-Length", "11",
-                   Body: "METHOD GET!",
-               },
-               Shutdown: std::net::Shutdown::Both,
-            );
-            let handle = handles.pop().expect("No more handles !");
-
-            let eyeballs = HappyEyeballs::new(
-                vec![SocketAddr::from_str(handle.addr.as_str()).unwrap()],
-                EyeBallConfig::new(None, None),
-            );
-            let handle = ylong_runtime::spawn(async move {
-                let tcp = tcp_stream(eyeballs).await.unwrap();
-                let res = tunnel(
-                    tcp,
-                    "ylong_http.com",
-                    443,
-                    Some(String::from("base64 bytes")),
-                )
-                .await;
-                assert_eq!(
-                    format!("{:?}", res.err()),
-                    format!(
-                        "{:?}",
-                        Some(other_io_error(CreateTunnelErr::ProxyAuthenticationRequired))
-                    )
-                );
-                handle
-                    .server_shutdown
-                    .recv()
-                    .expect("server send order failed !");
-            });
-            ylong_runtime::block_on(handle).unwrap();
-
-            start_tcp_server!(
-               Handles: handles,
-               EndWith: "\r\n\r\n",
-               Response: {
-                   Status: 402,
-                   Version: "HTTP/1.1",
-                   Header: "Content-Length", "11",
-                   Body: "METHOD GET!",
-               },
-               Shutdown: std::net::Shutdown::Both,
-            );
-            let handle = handles.pop().expect("No more handles !");
-
-            let eyeballs = HappyEyeballs::new(
-                vec![SocketAddr::from_str(handle.addr.as_str()).unwrap()],
-                EyeBallConfig::new(None, None),
-            );
-            let handle = ylong_runtime::spawn(async move {
-                let tcp = tcp_stream(eyeballs).await.unwrap();
-                let res = tunnel(
-                    tcp,
-                    "ylong_http.com",
-                    443,
-                    Some(String::from("base64 bytes")),
-                )
-                .await;
-                assert_eq!(
-                    format!("{:?}", res.err()),
-                    format!("{:?}", Some(other_io_error(CreateTunnelErr::Unsuccessful)))
-                );
-                handle
-                    .server_shutdown
-                    .recv()
-                    .expect("server send order failed !");
-            });
-            ylong_runtime::block_on(handle).unwrap();
-        }
-
-        /// UT test cases for `tunnel`.
-        ///
-        /// # Brief
-        /// 1. Creates a `tcp stream` by calling `tcp_stream`.
-        /// 2. Sends a `Request` by `tunnel`.
-        /// 3. Checks if the result is as expected.
-        #[test]
-        fn ut_ssl_tunnel_connect() {
-            let mut handles = vec![];
-
-            start_tcp_server!(
-               Handles: handles,
-               EndWith: "\r\n\r\n",
-                Response: {
-                   Status: 200,
-                   Version: "HTTP/1.1",
-                   Body: "",
-               },
-               Shutdown: std::net::Shutdown::Both,
-            );
-            let handle = handles.pop().expect("No more handles !");
-
-            let eyeballs = HappyEyeballs::new(
-                vec![SocketAddr::from_str(handle.addr.as_str()).unwrap()],
-                EyeBallConfig::new(None, None),
-            );
-            let handle = ylong_runtime::spawn(async move {
-                let tcp = tcp_stream(eyeballs).await.unwrap();
-                let res = tunnel(
-                    tcp,
-                    "ylong_http.com",
-                    443,
-                    Some(String::from("base64 bytes")),
-                )
-                .await;
-                assert!(res.is_ok());
-                handle
-                    .server_shutdown
-                    .recv()
-                    .expect("server send order failed !");
-            });
-            ylong_runtime::block_on(handle).unwrap();
-        }
-
-        /// UT test cases for response beyond size of `tunnel`.
-        ///
-        /// # Brief
-        /// 1. Creates a `tcp stream` by calling `tcp_stream`.
-        /// 2. Sends a `Request` by `tunnel`.
-        /// 3. Checks if the result is as expected.
-        #[test]
-        fn ut_ssl_tunnel_resp_beyond_size() {
-            let mut handles = vec![];
-
-            let buf = vec![b'b'; 8192];
-            let body = String::from_utf8(buf).unwrap();
-
-            start_tcp_server!(
-               Handles: handles,
-               EndWith: "\r\n\r\n",
-                Response: {
-                   Status: 200,
-                   Version: "HTTP/1.1",
-                   Header: "Content-Length", "11",
-                   Body: body.as_str(),
-               },
-            );
-            let handle = handles.pop().expect("No more handles !");
-
-            let eyeballs = HappyEyeballs::new(
-                vec![SocketAddr::from_str(handle.addr.as_str()).unwrap()],
-                EyeBallConfig::new(None, None),
-            );
-            let handle = ylong_runtime::spawn(async move {
-                let tcp = tcp_stream(eyeballs).await.unwrap();
-                let res = tunnel(
-                    tcp,
-                    "ylong_http.com",
-                    443,
-                    Some(String::from("base64 bytes")),
-                )
-                .await;
-                assert_eq!(
-                    format!("{:?}", res.err()),
-                    format!(
-                        "{:?}",
-                        Some(other_io_error(CreateTunnelErr::ProxyHeadersTooLong))
-                    )
-                );
-                handle
-                    .server_shutdown
-                    .recv()
-                    .expect("server send order failed !");
-            });
-            ylong_runtime::block_on(handle).unwrap();
-        }
+        Ok(HttpStream::new(stream, data))
     }
 }

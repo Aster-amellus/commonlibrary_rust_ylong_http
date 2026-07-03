@@ -15,6 +15,7 @@
 
 use core::convert::TryFrom;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ylong_http::headers::HeaderValue;
 use ylong_http::request::uri::{Authority, Scheme, Uri};
@@ -22,6 +23,10 @@ use ylong_http::request::uri::{Authority, Scheme, Uri};
 use crate::error::HttpClientError;
 use crate::util::base64::encode;
 use crate::util::normalizer::UriFormatter;
+#[cfg(test)]
+use crate::util::pool::PoolKey;
+
+static NEXT_PROXY_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// `Proxies` is responsible for managing a list of proxies.
 #[derive(Clone, Default)]
@@ -36,6 +41,25 @@ impl Proxies {
 
     pub(crate) fn match_proxy(&self, uri: &Uri) -> Option<&Proxy> {
         self.list.iter().find(|proxy| proxy.is_intercepted(uri))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pool_key(&self, uri: &Uri) -> PoolKey {
+        match self.match_proxy(uri) {
+            Some(proxy) => proxy.pool_key(uri),
+            None => {
+                // Pool keys are built after request URI normalization, the same
+                // invariant required by proxy matching.
+                PoolKey::new(
+                    uri.scheme().unwrap().clone(),
+                    uri.authority().unwrap().clone(),
+                )
+            }
+        }
+    }
+
+    pub(crate) fn proxy_pool_key(&self, uri: &Uri) -> Option<(u64, Scheme, Authority)> {
+        self.match_proxy(uri).map(Proxy::proxy_pool_key)
     }
 }
 
@@ -91,6 +115,7 @@ impl Proxy {
         self.no_proxy = NoProxy::from_str(no_proxy);
     }
 
+    #[cfg_attr(not(any(test, feature = "sync")), allow(dead_code))]
     pub(crate) fn via_proxy(&self, uri: &Uri) -> Uri {
         let info = self.intercept.proxy_info();
         let mut builder = Uri::builder();
@@ -124,6 +149,29 @@ impl Proxy {
             Intercept::Https(_) => !no_proxy && *uri.scheme().unwrap() == Scheme::HTTPS,
         }
     }
+
+    #[cfg(test)]
+    fn pool_key(&self, uri: &Uri) -> PoolKey {
+        let (id, scheme, authority) = self.proxy_pool_key();
+        // Pool keys are built after request URI normalization, the same
+        // invariant required by proxy matching.
+        PoolKey::proxied(
+            uri.scheme().unwrap().clone(),
+            uri.authority().unwrap().clone(),
+            id,
+            scheme,
+            authority,
+        )
+    }
+
+    fn proxy_pool_key(&self) -> (u64, Scheme, Authority) {
+        let info = self.intercept.proxy_info();
+        (
+            info.pool_key_id(),
+            info.scheme().clone(),
+            info.authority().clone(),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -146,9 +194,12 @@ impl Intercept {
 /// ProxyInfo which contains authentication, scheme and host.
 #[derive(Clone)]
 pub(crate) struct ProxyInfo {
+    pool_key_id: u64,
     pub(crate) scheme: Scheme,
     pub(crate) authority: Authority,
     pub(crate) basic_auth: Option<HeaderValue>,
+    #[cfg(feature = "__tls")]
+    pub(crate) tls_config: Option<crate::util::TlsConfig>,
 }
 
 impl ProxyInfo {
@@ -163,10 +214,16 @@ impl ProxyInfo {
         UriFormatter::new().format(&mut uri)?;
         let (scheme, authority, _, _) = uri.into_parts();
         // `scheme` and `authority` must have values after formatting.
+        // Relaxed ordering is sufficient: this counter only allocates distinct
+        // pool-key identities and does not synchronize access to proxy data.
+        let pool_key_id = NEXT_PROXY_POOL_ID.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
+            pool_key_id,
             basic_auth: None,
             scheme: scheme.unwrap(),
             authority: authority.unwrap(),
+            #[cfg(feature = "__tls")]
+            tls_config: None,
         })
     }
 
@@ -176,6 +233,10 @@ impl ProxyInfo {
 
     pub(crate) fn scheme(&self) -> &Scheme {
         &self.scheme
+    }
+
+    pub(crate) fn pool_key_id(&self) -> u64 {
+        self.pool_key_id
     }
 }
 
@@ -339,5 +400,77 @@ mod ut_proxy {
 
         let uri = Uri::from_bytes(b"http://127.0.0.1:80").unwrap();
         assert!(proxies.match_proxy(&uri).is_none());
+    }
+
+    /// UT test cases for HTTP proxy pool keys.
+    ///
+    /// # Brief
+    /// 1. Creates direct and HTTP-proxied keys for the same target URI.
+    /// 2. Checks if HTTP proxy matching and URI rewriting are unchanged.
+    /// 3. Checks if no_proxy uses the direct pool key.
+    #[test]
+    fn ut_http_proxy_pool_key() {
+        let uri = Uri::from_bytes(b"http://www.example.com/path").unwrap();
+        let direct = Proxies::default().pool_key(&uri);
+
+        let mut proxies = Proxies::default();
+        let proxy = Proxy::http("http://proxy.example.com").unwrap();
+        assert_eq!(
+            proxy.via_proxy(&uri).to_string(),
+            "http://proxy.example.com:80/path"
+        );
+        proxies.add_proxy(proxy);
+
+        assert!(proxies.match_proxy(&uri).is_some());
+        assert_ne!(direct, proxies.pool_key(&uri));
+
+        let mut no_proxy = Proxies::default();
+        let mut proxy = Proxy::http("http://proxy.example.com").unwrap();
+        proxy.no_proxy("http://www.example.com");
+        no_proxy.add_proxy(proxy);
+        assert!(no_proxy.match_proxy(&uri).is_none());
+        assert_eq!(direct, no_proxy.pool_key(&uri));
+    }
+
+    /// UT test cases for HTTPS proxy TLS pool keys.
+    ///
+    /// # Brief
+    /// 1. Creates two HTTPS proxy configurations with different TLS settings.
+    /// 2. Checks if the same target URI gets different pool keys.
+    /// 3. Checks if cloning preserves the proxy pool key identity.
+    #[cfg(feature = "__tls")]
+    #[test]
+    fn ut_https_proxy_tls_pool_key() {
+        let uri = Uri::from_bytes(b"https://www.example.com/path").unwrap();
+        let tls_a = crate::util::TlsConfig::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let tls_b = crate::util::TlsConfig::builder()
+            .danger_accept_invalid_hostnames(true)
+            .build()
+            .unwrap();
+
+        let mut proxies_a = Proxies::default();
+        proxies_a.add_proxy(
+            crate::Proxy::https("https://proxy.example.com:8443")
+                .proxy_tls_config(tls_a)
+                .build()
+                .unwrap()
+                .inner(),
+        );
+
+        let mut proxies_b = Proxies::default();
+        proxies_b.add_proxy(
+            crate::Proxy::https("https://proxy.example.com:8443")
+                .proxy_tls_config(tls_b)
+                .build()
+                .unwrap()
+                .inner(),
+        );
+
+        let key_a = proxies_a.pool_key(&uri);
+        assert_ne!(key_a, proxies_b.pool_key(&uri));
+        assert_eq!(key_a, proxies_a.clone().pool_key(&uri));
     }
 }
