@@ -20,7 +20,7 @@ use ylong_http_client::{EmptyBody, HttpClientError, Proxy, Request};
 fn main() -> Result<(), HttpClientError> {
     // Creates a `sync_impl::Client`
     let client = ClientBuilder::new()
-        .proxy(Proxy::http("https://proxy.example.com").build()?)
+        .proxy(Proxy::http("http://proxy.example.com").build()?)
         .build()?;
     // Creates a `Request`.
 

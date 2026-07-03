@@ -66,9 +66,56 @@ async fn create_client_with_builder() {
 - `add_root_certificate`: 设置根证书
 - `min_tls_version`: 设置 TLS 版本下限
 - `max_tls_version`: 设置 TLS 版本上限
-- `set_cipher_suite`: 设置 TLSv1.3 的算法套件
-- `set_cipher_list`: 设置 TLSv1.3 之前版本的算法套件
-- `set_ca_file`: 设置 CA 证书文件路径
+- `tls_cipher_suite`: 设置 TLSv1.3 的算法套件
+- `tls_cipher_list`: 设置 TLSv1.3 之前版本的算法套件
+- `tls_ca_file`: 设置 CA 证书文件路径
+
+#### 配置异步 HTTPS 代理
+
+异步客户端支持通过 `https://` 代理服务器发送 HTTP 和 HTTPS 请求。代理服务器本身的 TLS 配置通过
+`Proxy::proxy_tls_config` 设置，目标站点的 TLS 配置仍然通过 `ClientBuilder` 设置，两者互不影响。
+
+```rust
+use ylong_http_client::async_impl::{Body, ClientBuilder, Request};
+use ylong_http_client::{HttpClientError, Proxy, TlsConfig, TlsFileType, TlsVersion};
+
+async fn request_via_https_proxy() -> Result<(), HttpClientError> {
+    let proxy_tls = TlsConfig::builder()
+        .ca_file("certs/proxy-ca.pem")
+        .certificate_chain_file("certs/proxy-client-chain.pem")
+        .private_key_file("certs/proxy-client-key.pem", TlsFileType::PEM)
+        .min_proto_version(TlsVersion::TLS_1_2)
+        .cipher_suite("TLS_AES_128_GCM_SHA256")
+        .build()?;
+
+    let proxy = Proxy::all("https://proxy.example.com:8443")
+        .basic_auth("username", "password")
+        .proxy_tls_config(proxy_tls)
+        .build()?;
+
+    let client = ClientBuilder::new()
+        .proxy(proxy)
+        .tls_ca_file("certs/origin-ca.pem")
+        .build()?;
+
+    let request = Request::builder()
+        .url("https://www.example.com/")
+        .body(Body::empty())?;
+
+    let _response = client.request(request).await?;
+    Ok(())
+}
+```
+
+HTTP 目标站点会在代理 TLS 连接内发送 absolute-form 请求；HTTPS 目标站点会先在代理 TLS 连接内发送
+`CONNECT`，隧道建立后再与目标站点进行独立 TLS 握手。当前 HTTPS 代理能力覆盖异步客户端；`sync` 和
+`http3` 适配不在当前范围内。
+
+示例可用以下命令检查：
+
+```shell
+cargo check -p ylong_http_client --features "async,http1_1,tokio_base,c_openssl_3_0" --example async_https_proxy
+```
 
 #### 创建请求
 
