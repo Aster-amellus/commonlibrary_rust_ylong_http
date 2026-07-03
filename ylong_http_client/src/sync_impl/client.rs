@@ -424,6 +424,22 @@ impl ClientBuilder {
         self
     }
 
+    /// Sets the list of supported ciphersuites for `TLSv1.3`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ylong_http_client::sync_impl::ClientBuilder;
+    ///
+    /// let builder = ClientBuilder::new()
+    ///     .tls_cipher_suite("TLS_AES_256_GCM_SHA384");
+    /// ```
+    #[cfg(feature = "__c_openssl")]
+    pub fn tls_cipher_suite(mut self, list: &str) -> Self {
+        self.tls = self.tls.cipher_suite(list);
+        self
+    }
+
     /// Controls the use of built-in system certificates during certificate
     /// validation. Default to `true` -- uses built-in system certs.
     ///

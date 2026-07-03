@@ -56,6 +56,10 @@ extern "C" {
     /// This function does not impact TLSv1.3 ciphersuites.
     pub(crate) fn SSL_CTX_set_cipher_list(ssl: *mut SSL_CTX, s: *const c_char) -> c_int;
 
+    /// Configures the available TLSv1.3 ciphersuites for ctx.
+    #[cfg(feature = "__c_openssl")]
+    pub(crate) fn SSL_CTX_set_ciphersuites(ssl: *mut SSL_CTX, s: *const c_char) -> c_int;
+
     /// Loads the first certificate stored in file into ctx.
     /// The formatting type of the certificate must be specified from the known
     /// types SSL_FILETYPE_PEM, SSL_FILETYPE_ASN1.
@@ -64,6 +68,16 @@ extern "C" {
         cert_file: *const c_char,
         file_type: c_int,
     ) -> c_int;
+
+    /// Loads a private key file into ctx.
+    pub(crate) fn SSL_CTX_use_PrivateKey_file(
+        ctx: *mut SSL_CTX,
+        key_file: *const c_char,
+        file_type: c_int,
+    ) -> c_int;
+
+    /// Checks that the private key matches the currently configured certificate.
+    pub(crate) fn SSL_CTX_check_private_key(ctx: *const SSL_CTX) -> c_int;
 
     /// Loads a certificate chain from file into ctx. The certificates must be
     /// in PEM format and must be sorted starting with the subject's
