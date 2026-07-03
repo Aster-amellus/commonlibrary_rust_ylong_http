@@ -45,6 +45,7 @@ fn sdv_async_client_send_request() {
             Path: "/data",
             Header: "Content-Length", "6",
             Header: "Accept", "*/*",
+            Header: "Proxy-Authorization", "Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
             Body: "Hello!",
         },
         Response: {
@@ -61,6 +62,7 @@ fn sdv_async_client_send_request() {
             ylong_http_client::Proxy::http(
                 format!("http://{}{}", handle.addr.as_str(), "/data").as_str(),
             )
+            .basic_auth("username", "password")
             .build()
             .expect("Http proxy build failed"),
         )
