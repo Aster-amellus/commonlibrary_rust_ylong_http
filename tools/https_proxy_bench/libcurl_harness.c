@@ -22,8 +22,11 @@ typedef struct {
     long proxy_type;
     long insecure_proxy;
     long insecure_origin;
+    int share_connections;
     size_t requests;
     size_t warmup_requests;
+    uint64_t duration_seconds;
+    int duration_seconds_set;
     size_t concurrency;
     size_t read_buffer_size;
 } Config;
@@ -32,10 +35,11 @@ typedef struct {
     const Config *config;
     pthread_barrier_t *ready_barrier;
     pthread_barrier_t *start_barrier;
-    size_t start;
     size_t count;
     size_t warmup_count;
     uint64_t *latencies_us;
+    size_t latency_capacity;
+    CURLSH *share;
     uint64_t bytes;
     size_t completed;
     size_t errors;
@@ -57,6 +61,21 @@ static uint64_t now_us(void)
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
 }
 
+static void curl_lock(CURL *handle, curl_lock_data data, curl_lock_access access, void *userptr)
+{
+    (void)handle;
+    (void)data;
+    (void)access;
+    pthread_mutex_lock((pthread_mutex_t *)userptr);
+}
+
+static void curl_unlock(CURL *handle, curl_lock_data data, void *userptr)
+{
+    (void)handle;
+    (void)data;
+    pthread_mutex_unlock((pthread_mutex_t *)userptr);
+}
+
 static int cmp_u64(const void *a, const void *b)
 {
     uint64_t left = *(const uint64_t *)a;
@@ -72,6 +91,34 @@ static uint64_t percentile(const uint64_t *values, size_t len, size_t pct)
     return values[((len - 1) * pct) / 100];
 }
 
+static uint64_t percentile_permille(const uint64_t *values, size_t len, size_t permille)
+{
+    if (len == 0) {
+        return 0;
+    }
+    return values[((len - 1) * permille) / 1000];
+}
+
+static int record_latency(Worker *worker, uint64_t latency_us)
+{
+    if (worker->completed == worker->latency_capacity) {
+        if (worker->latency_capacity > SIZE_MAX / 2 / sizeof(uint64_t)) {
+            return 0;
+        }
+        size_t new_capacity = worker->latency_capacity == 0 ? 1024 : worker->latency_capacity * 2;
+        uint64_t *new_latencies =
+            realloc(worker->latencies_us, new_capacity * sizeof(uint64_t));
+        if (new_latencies == NULL) {
+            return 0;
+        }
+        worker->latencies_us = new_latencies;
+        worker->latency_capacity = new_capacity;
+    }
+    worker->latencies_us[worker->completed] = latency_us;
+    worker->completed++;
+    return 1;
+}
+
 static void set_common_options(CURL *curl, Worker *worker)
 {
     const Config *config = worker->config;
@@ -84,6 +131,9 @@ static void set_common_options(CURL *curl, Worker *worker)
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, worker);
     curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, (long)config->read_buffer_size);
+    if (worker->share != NULL) {
+        curl_easy_setopt(curl, CURLOPT_SHARE, worker->share);
+    }
 
     if (config->proxy_ca_file != NULL) {
         curl_easy_setopt(curl, CURLOPT_PROXY_CAINFO, config->proxy_ca_file);
@@ -115,7 +165,8 @@ static void *run_worker(void *arg)
     Worker *worker = (Worker *)arg;
     CURL *curl = curl_easy_init();
     if (curl == NULL) {
-        worker->errors += worker->warmup_count + worker->count;
+        worker->errors +=
+            worker->warmup_count + (worker->config->duration_seconds > 0 ? 1 : worker->count);
         pthread_barrier_wait(worker->ready_barrier);
         pthread_barrier_wait(worker->start_barrier);
         return NULL;
@@ -128,15 +179,35 @@ static void *run_worker(void *arg)
             worker->errors++;
         }
     }
+    worker->bytes = 0;
 
     pthread_barrier_wait(worker->ready_barrier);
     pthread_barrier_wait(worker->start_barrier);
 
+    if (worker->config->duration_seconds > 0) {
+        uint64_t deadline = now_us() + worker->config->duration_seconds * 1000000ULL;
+        while (now_us() < deadline) {
+            uint64_t started = now_us();
+            if (curl_easy_perform(curl) == CURLE_OK) {
+                if (!record_latency(worker, now_us() - started)) {
+                    worker->errors++;
+                    break;
+                }
+            } else {
+                worker->errors++;
+            }
+        }
+        curl_easy_cleanup(curl);
+        return NULL;
+    }
+
     for (size_t i = 0; i < worker->count; i++) {
         uint64_t started = now_us();
         if (curl_easy_perform(curl) == CURLE_OK) {
-            worker->latencies_us[worker->start + worker->completed] = now_us() - started;
-            worker->completed++;
+            if (!record_latency(worker, now_us() - started)) {
+                worker->errors++;
+                break;
+            }
         } else {
             worker->errors++;
         }
@@ -160,10 +231,11 @@ static void usage(const char *program)
 {
     fprintf(stderr,
             "usage: %s --url URL --proxy http[s]://PROXY[:PORT] [--requests N] "
-            "[--warmup-requests N] [--concurrency N] [--read-buffer-size N] "
+            "[--warmup-requests N] [--duration-seconds N] [--concurrency N] "
+            "[--read-buffer-size N] "
             "[--proxy-ca-file PEM] [--proxy-client-cert PEM] [--proxy-client-key PEM] "
             "[--origin-ca-file PEM] [--insecure-proxy] [--insecure-origin] "
-            "[--proxy-user-pass user:pass]\n",
+            "[--proxy-user-pass user:pass] [--share-connections]\n",
             program);
 }
 
@@ -185,6 +257,10 @@ static Config parse_args(int argc, char **argv)
         } else if (strcmp(argv[i], "--warmup-requests") == 0) {
             config.warmup_requests =
                 strtoull(next_value(&i, argc, argv, "--warmup-requests"), NULL, 10);
+        } else if (strcmp(argv[i], "--duration-seconds") == 0) {
+            config.duration_seconds =
+                strtoull(next_value(&i, argc, argv, "--duration-seconds"), NULL, 10);
+            config.duration_seconds_set = 1;
         } else if (strcmp(argv[i], "--concurrency") == 0) {
             config.concurrency = strtoull(next_value(&i, argc, argv, "--concurrency"), NULL, 10);
         } else if (strcmp(argv[i], "--read-buffer-size") == 0) {
@@ -200,6 +276,8 @@ static Config parse_args(int argc, char **argv)
             config.origin_ca_file = next_value(&i, argc, argv, "--origin-ca-file");
         } else if (strcmp(argv[i], "--proxy-user-pass") == 0) {
             config.proxy_user_pass = next_value(&i, argc, argv, "--proxy-user-pass");
+        } else if (strcmp(argv[i], "--share-connections") == 0) {
+            config.share_connections = 1;
         } else if (strcmp(argv[i], "--insecure-proxy") == 0) {
             config.insecure_proxy = 1L;
         } else if (strcmp(argv[i], "--insecure-origin") == 0) {
@@ -214,9 +292,13 @@ static Config parse_args(int argc, char **argv)
         }
     }
 
-    if (config.url == NULL || config.proxy == NULL || config.requests == 0 ||
-        config.concurrency == 0 || config.read_buffer_size == 0) {
+    if (config.url == NULL || config.proxy == NULL || config.concurrency == 0 ||
+        config.read_buffer_size == 0 || (config.requests == 0 && config.duration_seconds == 0)) {
         usage(argv[0]);
+        exit(2);
+    }
+    if (config.duration_seconds_set && config.duration_seconds == 0) {
+        fprintf(stderr, "--duration-seconds must be > 0\n");
         exit(2);
     }
     if (strncmp(config.proxy, "https://", strlen("https://")) == 0) {
@@ -239,10 +321,13 @@ int main(int argc, char **argv)
     Config config = parse_args(argc, argv);
     pthread_t *threads = calloc(config.concurrency, sizeof(pthread_t));
     Worker *workers = calloc(config.concurrency, sizeof(Worker));
-    uint64_t *latencies = calloc(config.requests, sizeof(uint64_t));
+    uint64_t *latencies = NULL;
     pthread_barrier_t ready_barrier;
     pthread_barrier_t start_barrier;
-    if (threads == NULL || workers == NULL || latencies == NULL) {
+    pthread_mutex_t share_lock;
+    CURLSH *share = NULL;
+    int share_lock_initialized = 0;
+    if (threads == NULL || workers == NULL) {
         fprintf(stderr, "allocation failed\n");
         return 2;
     }
@@ -257,8 +342,34 @@ int main(int argc, char **argv)
     }
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    if (config.share_connections) {
+        CURLSHcode share_result;
+        if (pthread_mutex_init(&share_lock, NULL) != 0) {
+            fprintf(stderr, "share mutex init failed\n");
+            return 2;
+        }
+        share_lock_initialized = 1;
+        share = curl_share_init();
+        if (share == NULL) {
+            fprintf(stderr, "curl_share_init failed\n");
+            return 2;
+        }
+        share_result = curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+        if (share_result == CURLSHE_OK) {
+            share_result = curl_share_setopt(share, CURLSHOPT_LOCKFUNC, curl_lock);
+        }
+        if (share_result == CURLSHE_OK) {
+            share_result = curl_share_setopt(share, CURLSHOPT_UNLOCKFUNC, curl_unlock);
+        }
+        if (share_result == CURLSHE_OK) {
+            share_result = curl_share_setopt(share, CURLSHOPT_USERDATA, &share_lock);
+        }
+        if (share_result != CURLSHE_OK) {
+            fprintf(stderr, "curl_share_setopt failed: %s\n", curl_share_strerror(share_result));
+            return 2;
+        }
+    }
 
-    size_t cursor = 0;
     for (size_t i = 0; i < config.concurrency; i++) {
         size_t count = config.requests / config.concurrency;
         if (i < config.requests % config.concurrency) {
@@ -271,12 +382,21 @@ int main(int argc, char **argv)
         workers[i].config = &config;
         workers[i].ready_barrier = &ready_barrier;
         workers[i].start_barrier = &start_barrier;
-        workers[i].start = cursor;
         workers[i].count = count;
         workers[i].warmup_count = warmup_count;
-        workers[i].latencies_us = latencies;
-        cursor += count;
-        pthread_create(&threads[i], NULL, run_worker, &workers[i]);
+        workers[i].latency_capacity = config.duration_seconds > 0 || count == 0 ? 1024 : count;
+        workers[i].latencies_us = calloc(workers[i].latency_capacity, sizeof(uint64_t));
+        workers[i].share = share;
+        if (workers[i].latencies_us == NULL) {
+            fprintf(stderr, "allocation failed\n");
+            return 2;
+        }
+        int create_result = pthread_create(&threads[i], NULL, run_worker, &workers[i]);
+        if (create_result != 0) {
+            fprintf(stderr, "pthread_create failed for worker %zu: %s\n", i,
+                    strerror(create_result));
+            return 2;
+        }
     }
 
     pthread_barrier_wait(&ready_barrier);
@@ -290,35 +410,66 @@ int main(int argc, char **argv)
         pthread_join(threads[i], NULL);
         errors += workers[i].errors;
         bytes += workers[i].bytes;
-        memmove(&latencies[completed], &latencies[workers[i].start],
-                workers[i].completed * sizeof(uint64_t));
         completed += workers[i].completed;
     }
     uint64_t elapsed_us = now_us() - started;
 
     if (completed > 0) {
+        latencies = calloc(completed, sizeof(uint64_t));
+        if (latencies == NULL) {
+            fprintf(stderr, "allocation failed\n");
+            return 2;
+        }
+        size_t cursor = 0;
+        for (size_t i = 0; i < config.concurrency; i++) {
+            memmove(&latencies[cursor], workers[i].latencies_us,
+                    workers[i].completed * sizeof(uint64_t));
+            cursor += workers[i].completed;
+        }
+    }
+    if (completed > 0) {
         qsort(latencies, completed, sizeof(uint64_t), cmp_u64);
+    }
+
+    char duration_seconds[32];
+    if (config.duration_seconds > 0) {
+        snprintf(duration_seconds, sizeof(duration_seconds), "%llu",
+                 (unsigned long long)config.duration_seconds);
+    } else {
+        snprintf(duration_seconds, sizeof(duration_seconds), "null");
     }
 
     double rps = elapsed_us == 0 ? 0.0 : (double)completed * 1000000.0 / (double)elapsed_us;
     printf("{\"client\":\"libcurl\",\"url\":\"%s\",\"proxy\":\"%s\","
-           "\"requests\":%zu,\"warmup_requests\":%zu,\"completed\":%zu,"
+           "\"requests\":%zu,\"warmup_requests\":%zu,\"duration_seconds\":%s,\"completed\":%zu,"
            "\"errors\":%zu,\"concurrency\":%zu,\"read_buffer_size\":%zu,"
-           "\"bytes\":%llu,\"elapsed_ms\":%.3f,\"rps\":%.3f,"
+           "\"connection_cache\":\"%s\",\"bytes\":%llu,\"elapsed_ms\":%.3f,\"rps\":%.3f,"
            "\"latency_us_p50\":%llu,\"latency_us_p90\":%llu,"
-           "\"latency_us_p95\":%llu,\"latency_us_p99\":%llu}\n",
-           config.url, config.proxy, config.requests, config.warmup_requests, completed, errors,
-           config.concurrency, config.read_buffer_size, (unsigned long long)bytes,
+           "\"latency_us_p95\":%llu,\"latency_us_p99\":%llu,"
+           "\"latency_us_p999\":%llu}\n",
+           config.url, config.proxy, config.requests, config.warmup_requests, duration_seconds,
+           completed, errors, config.concurrency, config.read_buffer_size,
+           config.share_connections ? "shared" : "per-thread", (unsigned long long)bytes,
            (double)elapsed_us / 1000.0, rps,
            (unsigned long long)percentile(latencies, completed, 50),
            (unsigned long long)percentile(latencies, completed, 90),
            (unsigned long long)percentile(latencies, completed, 95),
-           (unsigned long long)percentile(latencies, completed, 99));
+           (unsigned long long)percentile(latencies, completed, 99),
+           (unsigned long long)percentile_permille(latencies, completed, 999));
 
+    if (share != NULL) {
+        curl_share_cleanup(share);
+    }
+    if (share_lock_initialized) {
+        pthread_mutex_destroy(&share_lock);
+    }
     curl_global_cleanup();
     pthread_barrier_destroy(&ready_barrier);
     pthread_barrier_destroy(&start_barrier);
     free(latencies);
+    for (size_t i = 0; i < config.concurrency; i++) {
+        free(workers[i].latencies_us);
+    }
     free(workers);
     free(threads);
     return errors == 0 ? 0 : 1;

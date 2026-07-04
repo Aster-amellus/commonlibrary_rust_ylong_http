@@ -1,0 +1,12 @@
+[package]
+name = "https_proxy_bench_fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+openssl = "0.10.29"
+tokio = { version = "1.20.1", features = ["io-util", "net", "rt", "rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-openssl = "0.6.3"
