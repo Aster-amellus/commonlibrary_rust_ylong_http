@@ -33,7 +33,7 @@ pub(crate) async fn bind(config: Config, metrics: Arc<Metrics>) -> Result<ProxyS
                 config.proxy_host, config.proxy_port
             )
         })?;
-    let acceptor = Arc::new(server_acceptor(&config, config.require_client_cert)?);
+    let acceptor = Arc::new(server_acceptor(&config, config.require_client_cert, false)?);
 
     Ok(ProxyServer {
         listener,
@@ -320,6 +320,7 @@ mod tests {
             ca_file: None,
             require_client_cert: false,
             origin_tls: false,
+            origin_http2: false,
             origin_host: "127.0.0.1".to_string(),
             origin_port: 18080,
             proxy_host: "127.0.0.1".to_string(),
@@ -329,6 +330,7 @@ mod tests {
             relay_buffer_size: 16 * 1024,
             origin_delay_ms: 0,
             origin_close_every_n_requests: None,
+            tls_groups: None,
         }
     }
 

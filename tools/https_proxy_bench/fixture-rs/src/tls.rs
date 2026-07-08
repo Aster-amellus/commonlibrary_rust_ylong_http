@@ -1,10 +1,13 @@
-use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
+use openssl::ssl::{
+    select_next_proto, AlpnError, SslAcceptor, SslFiletype, SslMethod, SslVerifyMode,
+};
 
 use crate::config::Config;
 
 pub(crate) fn server_acceptor(
     config: &Config,
     require_client_cert: bool,
+    enable_h2_alpn: bool,
 ) -> Result<SslAcceptor, String> {
     let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())
         .map_err(|e| format!("failed to create TLS acceptor: {e}"))?;
@@ -17,6 +20,17 @@ pub(crate) fn server_acceptor(
     builder
         .check_private_key()
         .map_err(|e| format!("certificate and private key do not match: {e}"))?;
+
+    if let Some(groups) = &config.tls_groups {
+        builder
+            .set_groups_list(groups)
+            .map_err(|e| format!("failed to set TLS groups {groups}: {e}"))?;
+    }
+    if enable_h2_alpn {
+        builder.set_alpn_select_callback(|_, client| {
+            select_next_proto(b"\x02h2\x08http/1.1", client).ok_or(AlpnError::NOACK)
+        });
+    }
 
     if require_client_cert {
         let ca_file = config

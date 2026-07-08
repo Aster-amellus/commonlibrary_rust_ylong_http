@@ -98,12 +98,13 @@ fn fixture_start_json(config: &Config) -> String {
         .map_or_else(|| "null".to_string(), |value| value.to_string());
 
     format!(
-        "{{\"event\":\"fixture_start\",\"origin_url\":\"{}\",\"https_proxy\":\"{}\",\"response_size\":{},\"response_size_sequence\":{},\"origin_tls\":{},\"origin_close_every_n_requests\":{}}}",
+        "{{\"event\":\"fixture_start\",\"origin_url\":\"{}\",\"https_proxy\":\"{}\",\"response_size\":{},\"response_size_sequence\":{},\"origin_tls\":{},\"origin_http2\":{},\"origin_close_every_n_requests\":{}}}",
         json_escape(&origin_url),
         json_escape(&https_proxy),
         config.response_size,
         json_usize_array(&config.response_size_sequence),
         config.origin_tls,
+        config.origin_http2,
         origin_close
     )
 }
@@ -152,6 +153,7 @@ mod tests {
             ca_file: None,
             require_client_cert: false,
             origin_tls: false,
+            origin_http2: false,
             origin_host: "origin.test".to_string(),
             origin_port: 18080,
             proxy_host: "proxy.test".to_string(),
@@ -161,6 +163,7 @@ mod tests {
             relay_buffer_size: 16 * 1024,
             origin_delay_ms: 0,
             origin_close_every_n_requests: None,
+            tls_groups: None,
         }
     }
 
@@ -173,6 +176,7 @@ mod tests {
         assert!(json.contains("\"origin_url\":\"http://origin.test:18080/\""));
         assert!(json.contains("\"https_proxy\":\"https://proxy.test:18443\""));
         assert!(json.contains("\"response_size_sequence\":[]"));
+        assert!(json.contains("\"origin_http2\":false"));
         assert!(json.contains("\"origin_close_every_n_requests\":null"));
     }
 
@@ -192,11 +196,14 @@ mod tests {
     fn startup_json_includes_scenario_controls() {
         let mut config = test_config();
         config.response_size_sequence = vec![1024, 4096, 65536];
+        config.origin_tls = true;
+        config.origin_http2 = true;
         config.origin_close_every_n_requests = Some(100);
 
         let json = fixture_start_json(&config);
 
         assert!(json.contains("\"response_size_sequence\":[1024,4096,65536]"));
+        assert!(json.contains("\"origin_http2\":true"));
         assert!(json.contains("\"origin_close_every_n_requests\":100"));
     }
 }

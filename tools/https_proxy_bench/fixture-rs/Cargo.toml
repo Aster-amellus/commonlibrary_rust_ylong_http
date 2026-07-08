@@ -7,6 +7,9 @@ publish = false
 [workspace]
 
 [dependencies]
+bytes = "1"
+h2 = "0.3.27"
+http = "0.2.12"
 openssl = "0.10.29"
 tokio = { version = "1.20.1", features = ["io-util", "net", "rt", "rt-multi-thread", "macros", "signal", "sync", "time"] }
 tokio-openssl = "0.6.3"

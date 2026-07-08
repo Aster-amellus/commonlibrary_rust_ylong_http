@@ -316,6 +316,12 @@ The comparator must record:
 - fixture counters for handshakes, CONNECT requests, forwarded requests, and
   proxy/origin errors.
 
+When validating libcurl's HTTP/2 multi interface as a possible stronger
+baseline, record whether `--libcurl-pipewait` is enabled and any configured
+`--libcurl-max-host-connections`, `--libcurl-max-total-connections`, or
+`--libcurl-max-concurrent-streams` values. These knobs are comparator controls;
+they are not part of the default ylong-vs-libcurl easy-threaded comparison.
+
 Run order should alternate ylong and libcurl, or the scenario should be repeated
 enough to estimate run-to-run noise. Do not use libcurl shared-cache mode as the
 default comparator unless the experiment is specifically about shared cache

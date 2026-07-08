@@ -25,6 +25,9 @@ Options forwarded to both clients:
   --insecure-proxy
   --insecure-origin
   --proxy-user-pass user:pass
+  --http-version h1|h2|negotiate
+  --tls13-ciphers LIST
+  --tls-groups LIST
 
 Environment:
   PROFILE=perf-stat    run each client under perf stat when available
@@ -35,7 +38,14 @@ Environment:
   YLONG_PHASE_METRICS=1 enable ylong benchmark-only phase metrics
   YLONG_EXTRA_FEATURES="..." append internal ylong benchmark features
   YLONG_MAX_H1_CONN_NUMBER=N ylong-only max HTTP/1 connections per pool key
+  YLONG_MAX_H2_CONN_NUMBER=N ylong-only max HTTP/2 connections per pool key
+  YLONG_ALLOWED_CACHE_FRAME_SIZE=N ylong-only HTTP/2 response frame channel capacity
   LIBCURL_SHARE_CONNECTIONS=0|1
+  LIBCURL_MODE=easy-threads|multi
+  LIBCURL_PIPEWAIT=0|1
+  LIBCURL_MAX_HOST_CONNECTIONS=N
+  LIBCURL_MAX_TOTAL_CONNECTIONS=N
+  LIBCURL_MAX_CONCURRENT_STREAMS=N
   OPENSSL_LIB_DIR      OpenSSL library directory; auto-detected with pkg-config
   OPENSSL_INCLUDE_DIR  OpenSSL include directory; auto-detected with pkg-config
 USAGE
@@ -72,6 +82,18 @@ if command -v pkg-config >/dev/null 2>&1; then
 fi
 
 ylong_features="async http1_1 tokio_base c_openssl_3_0"
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+    if [[ "${args[$i]}" == "--http-version" && $((i + 1)) -lt ${#args[@]} ]]; then
+        case "${args[$((i + 1))]}" in
+            h2|http2|http/2|negotiate|alpn)
+                ylong_features="$ylong_features http2"
+                ;;
+            *)
+                ;;
+        esac
+    fi
+done
 if [[ "${YLONG_PHASE_METRICS:-0}" == "1" ]]; then
     ylong_features="$ylong_features __bench_phase_metrics"
 fi
@@ -151,8 +173,29 @@ fi
 if [[ -n "${YLONG_MAX_H1_CONN_NUMBER:-}" ]]; then
     ylong_args+=(--max-h1-conn-number "$YLONG_MAX_H1_CONN_NUMBER")
 fi
+if [[ -n "${YLONG_MAX_H2_CONN_NUMBER:-}" ]]; then
+    ylong_args+=(--max-h2-conn-number "$YLONG_MAX_H2_CONN_NUMBER")
+fi
+if [[ -n "${YLONG_ALLOWED_CACHE_FRAME_SIZE:-}" ]]; then
+    ylong_args+=(--allowed-cache-frame-size "$YLONG_ALLOWED_CACHE_FRAME_SIZE")
+fi
 if [[ "${LIBCURL_SHARE_CONNECTIONS:-0}" == "1" ]]; then
     curl_args+=(--share-connections)
+fi
+if [[ -n "${LIBCURL_MODE:-}" ]]; then
+    curl_args+=(--libcurl-mode "$LIBCURL_MODE")
+fi
+if [[ "${LIBCURL_PIPEWAIT:-0}" == "1" ]]; then
+    curl_args+=(--libcurl-pipewait)
+fi
+if [[ -n "${LIBCURL_MAX_HOST_CONNECTIONS:-}" ]]; then
+    curl_args+=(--libcurl-max-host-connections "$LIBCURL_MAX_HOST_CONNECTIONS")
+fi
+if [[ -n "${LIBCURL_MAX_TOTAL_CONNECTIONS:-}" ]]; then
+    curl_args+=(--libcurl-max-total-connections "$LIBCURL_MAX_TOTAL_CONNECTIONS")
+fi
+if [[ -n "${LIBCURL_MAX_CONCURRENT_STREAMS:-}" ]]; then
+    curl_args+=(--libcurl-max-concurrent-streams "$LIBCURL_MAX_CONCURRENT_STREAMS")
 fi
 
 if [[ "$client_filter" != "libcurl" ]]; then

@@ -5,6 +5,7 @@ pub(crate) struct Config {
     pub(crate) ca_file: Option<String>,
     pub(crate) require_client_cert: bool,
     pub(crate) origin_tls: bool,
+    pub(crate) origin_http2: bool,
     pub(crate) origin_host: String,
     pub(crate) origin_port: u16,
     pub(crate) proxy_host: String,
@@ -14,6 +15,7 @@ pub(crate) struct Config {
     pub(crate) relay_buffer_size: usize,
     pub(crate) origin_delay_ms: u64,
     pub(crate) origin_close_every_n_requests: Option<usize>,
+    pub(crate) tls_groups: Option<String>,
 }
 
 impl Config {
@@ -28,6 +30,7 @@ impl Config {
             ca_file: None,
             require_client_cert: false,
             origin_tls: false,
+            origin_http2: false,
             origin_host: "127.0.0.1".to_string(),
             origin_port: 18080,
             proxy_host: "127.0.0.1".to_string(),
@@ -37,6 +40,7 @@ impl Config {
             relay_buffer_size: 16 * 1024,
             origin_delay_ms: 0,
             origin_close_every_n_requests: None,
+            tls_groups: None,
         };
 
         let mut index = 1;
@@ -47,6 +51,7 @@ impl Config {
                 "--ca-file" => config.ca_file = Some(next_value(&args, &mut index, "--ca-file")?),
                 "--require-client-cert" => config.require_client_cert = true,
                 "--origin-tls" => config.origin_tls = true,
+                "--origin-http2" => config.origin_http2 = true,
                 "--origin-host" => {
                     config.origin_host = next_value(&args, &mut index, "--origin-host")?
                 }
@@ -89,6 +94,9 @@ impl Config {
                     }
                     config.origin_close_every_n_requests = Some(value);
                 }
+                "--tls-groups" => {
+                    config.tls_groups = Some(next_value(&args, &mut index, "--tls-groups")?)
+                }
                 "--help" | "-h" => return Err(usage()),
                 other => return Err(format!("unknown argument: {other}")),
             }
@@ -103,6 +111,9 @@ impl Config {
         }
         if config.require_client_cert && config.ca_file.is_none() {
             return Err("--require-client-cert requires --ca-file".to_string());
+        }
+        if config.origin_http2 && !config.origin_tls {
+            return Err("--origin-http2 requires --origin-tls".to_string());
         }
         if config.response_size == 0 {
             return Err("--response-size must be > 0".to_string());
@@ -165,7 +176,7 @@ fn parse_u64(value: String) -> Result<u64, String> {
 }
 
 fn usage() -> String {
-    "usage: https_proxy_bench_fixture --cert-file PEM --key-file PEM [--ca-file PEM] [--require-client-cert] [--origin-tls] [--origin-host HOST] [--origin-port PORT] [--proxy-host HOST] [--proxy-port PORT] [--response-size N] [--response-size-sequence N,N,...] [--relay-buffer-size N] [--origin-delay-ms N] [--origin-close-every-n-requests N]".to_string()
+    "usage: https_proxy_bench_fixture --cert-file PEM --key-file PEM [--ca-file PEM] [--require-client-cert] [--origin-tls] [--origin-http2] [--origin-host HOST] [--origin-port PORT] [--proxy-host HOST] [--proxy-port PORT] [--response-size N] [--response-size-sequence N,N,...] [--relay-buffer-size N] [--origin-delay-ms N] [--origin-close-every-n-requests N] [--tls-groups LIST]".to_string()
 }
 
 #[cfg(test)]
@@ -232,6 +243,56 @@ mod tests {
 
         assert_eq!(config.response_size_sequence, vec![1024, 4096, 65536]);
         assert_eq!(config.origin_close_every_n_requests, Some(100));
+    }
+
+    #[test]
+    fn parses_tls_groups() {
+        let args = vec![
+            "fixture".to_string(),
+            "--cert-file".to_string(),
+            "server.pem".to_string(),
+            "--key-file".to_string(),
+            "server.key".to_string(),
+            "--tls-groups".to_string(),
+            "X25519".to_string(),
+        ];
+
+        let config = Config::parse_from(args).unwrap();
+
+        assert_eq!(config.tls_groups.as_deref(), Some("X25519"));
+    }
+
+    #[test]
+    fn parses_origin_http2() {
+        let args = vec![
+            "fixture".to_string(),
+            "--cert-file".to_string(),
+            "server.pem".to_string(),
+            "--key-file".to_string(),
+            "server.key".to_string(),
+            "--origin-tls".to_string(),
+            "--origin-http2".to_string(),
+        ];
+
+        let config = Config::parse_from(args).unwrap();
+
+        assert!(config.origin_http2);
+    }
+
+    #[test]
+    fn rejects_origin_http2_without_origin_tls() {
+        let args = vec![
+            "fixture".to_string(),
+            "--cert-file".to_string(),
+            "server.pem".to_string(),
+            "--key-file".to_string(),
+            "server.key".to_string(),
+            "--origin-http2".to_string(),
+        ];
+
+        let err = Config::parse_from(args).unwrap_err();
+
+        assert_eq!(err, "--origin-http2 requires --origin-tls");
     }
 
     #[test]

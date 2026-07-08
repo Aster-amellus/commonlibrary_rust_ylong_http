@@ -14,12 +14,15 @@
 //! Minimal async HTTPS proxy benchmark client for comparison with libcurl.
 
 use std::env;
+use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Barrier;
 use ylong_http_client::async_impl::{Body, Client, ClientBuilder, Request, Response};
-use ylong_http_client::{HttpClientError, Proxy, TlsConfig, TlsFileType};
+use ylong_http_client::{HttpClientError, Proxy, TlsConfig, TlsFileType, Uri};
+
+const MAX_ERROR_SAMPLES: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 enum ClientMode {
@@ -36,6 +39,25 @@ impl ClientMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HttpVersionMode {
+    Http1,
+    #[cfg(feature = "http2")]
+    Http2,
+    Negotiate,
+}
+
+impl HttpVersionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http1 => "h1",
+            #[cfg(feature = "http2")]
+            Self::Http2 => "h2",
+            Self::Negotiate => "negotiate",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Config {
     url: String,
@@ -46,7 +68,12 @@ struct Config {
     concurrency: usize,
     read_buffer_size: usize,
     client_mode: ClientMode,
+    http_version: HttpVersionMode,
     max_h1_conn_number: Option<usize>,
+    max_h2_conn_number: Option<usize>,
+    allowed_cache_frame_size: Option<usize>,
+    tls13_ciphers: Option<String>,
+    tls_groups: Option<String>,
     proxy_ca_file: Option<String>,
     proxy_client_cert: Option<String>,
     proxy_client_key: Option<String>,
@@ -61,6 +88,27 @@ struct WorkerResult {
     latencies_us: Vec<u128>,
     bytes: u64,
     errors: usize,
+    error_samples: Vec<String>,
+}
+
+impl WorkerResult {
+    fn with_capacity(latency_capacity: usize) -> Self {
+        Self {
+            // PERF: The benchmark should measure the client, not repeated
+            // latency-sample reallocations in the harness. Fixed-request runs
+            // know the per-worker upper bound, and duration runs match the
+            // libcurl harness by starting with 1024 slots per worker.
+            latencies_us: Vec::with_capacity(latency_capacity),
+            bytes: 0,
+            errors: 0,
+            error_samples: Vec::with_capacity(MAX_ERROR_SAMPLES),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RequestTemplate {
+    uri: Uri,
 }
 
 fn usage(program: &str) {
@@ -72,7 +120,9 @@ fn usage(program: &str) {
          [--proxy-client-cert PEM] [--proxy-client-key PEM] \
          [--origin-ca-file PEM] [--insecure-proxy] [--insecure-origin] \
          [--proxy-user-pass user:pass] [--client-mode shared|per-worker] \
-         [--max-h1-conn-number N]"
+         [--http-version h1|h2|negotiate] [--max-h1-conn-number N] \
+         [--max-h2-conn-number N] [--allowed-cache-frame-size N] \
+         [--tls13-ciphers LIST] [--tls-groups LIST]"
     );
 }
 
@@ -103,7 +153,12 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
         concurrency: 16,
         read_buffer_size: 64 * 1024,
         client_mode: ClientMode::Shared,
+        http_version: HttpVersionMode::Http1,
         max_h1_conn_number: None,
+        max_h2_conn_number: None,
+        allowed_cache_frame_size: None,
+        tls13_ciphers: None,
+        tls_groups: None,
         proxy_ca_file: None,
         proxy_client_cert: None,
         proxy_client_key: None,
@@ -159,12 +214,36 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
                 config.client_mode =
                     parse_client_mode(next_value(&args, &mut index, "--client-mode")?)?
             }
+            "--http-version" => {
+                config.http_version =
+                    parse_http_version_mode(next_value(&args, &mut index, "--http-version")?)?
+            }
             "--max-h1-conn-number" => {
                 config.max_h1_conn_number = Some(parse_usize(next_value(
                     &args,
                     &mut index,
                     "--max-h1-conn-number",
                 )?)?)
+            }
+            "--max-h2-conn-number" => {
+                config.max_h2_conn_number = Some(parse_usize(next_value(
+                    &args,
+                    &mut index,
+                    "--max-h2-conn-number",
+                )?)?)
+            }
+            "--allowed-cache-frame-size" => {
+                config.allowed_cache_frame_size = Some(parse_usize(next_value(
+                    &args,
+                    &mut index,
+                    "--allowed-cache-frame-size",
+                )?)?)
+            }
+            "--tls13-ciphers" => {
+                config.tls13_ciphers = Some(next_value(&args, &mut index, "--tls13-ciphers")?)
+            }
+            "--tls-groups" => {
+                config.tls_groups = Some(next_value(&args, &mut index, "--tls-groups")?)
             }
             "--insecure-proxy" => config.insecure_proxy = true,
             "--insecure-origin" => config.insecure_origin = true,
@@ -191,6 +270,12 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
     if config.max_h1_conn_number == Some(0) {
         return Err("--max-h1-conn-number must be > 0".to_string());
     }
+    if config.max_h2_conn_number == Some(0) {
+        return Err("--max-h2-conn-number must be > 0".to_string());
+    }
+    if config.allowed_cache_frame_size == Some(0) {
+        return Err("--allowed-cache-frame-size must be > 0".to_string());
+    }
     if config.proxy_client_cert.is_some() != config.proxy_client_key.is_some() {
         return Err("--proxy-client-cert and --proxy-client-key must be set together".to_string());
     }
@@ -203,6 +288,24 @@ fn parse_client_mode(value: String) -> Result<ClientMode, String> {
         "shared" => Ok(ClientMode::Shared),
         "per-worker" => Ok(ClientMode::PerWorker),
         _ => Err(format!("invalid --client-mode: {value}")),
+    }
+}
+
+fn parse_http_version_mode(value: String) -> Result<HttpVersionMode, String> {
+    match value.as_str() {
+        "h1" | "http1" | "http/1.1" => Ok(HttpVersionMode::Http1),
+        "h2" | "http2" | "http/2" => {
+            #[cfg(feature = "http2")]
+            {
+                Ok(HttpVersionMode::Http2)
+            }
+            #[cfg(not(feature = "http2"))]
+            {
+                Err("--http-version h2 requires the http2 feature".to_string())
+            }
+        }
+        "negotiate" | "alpn" => Ok(HttpVersionMode::Negotiate),
+        _ => Err(format!("invalid --http-version: {value}")),
     }
 }
 
@@ -220,6 +323,12 @@ fn parse_u64(value: String) -> Result<u64, String> {
 
 fn proxy_tls_config(config: &Config) -> Result<TlsConfig, HttpClientError> {
     let mut builder = TlsConfig::builder();
+    if let Some(list) = &config.tls13_ciphers {
+        builder = builder.cipher_suite(list);
+    }
+    if let Some(groups) = &config.tls_groups {
+        builder = builder.groups_list(groups);
+    }
     if let Some(path) = &config.proxy_ca_file {
         builder = builder.ca_file(path);
     }
@@ -248,8 +357,28 @@ fn build_client(config: &Config) -> Result<Client, HttpClientError> {
     }
 
     let mut builder = ClientBuilder::new().proxy(proxy_builder.build()?);
+    builder = match config.http_version {
+        HttpVersionMode::Http1 => builder.http1_only(),
+        #[cfg(feature = "http2")]
+        HttpVersionMode::Http2 => builder.http2_prior_knowledge(),
+        HttpVersionMode::Negotiate => builder,
+    };
     if let Some(max_h1_conn_number) = config.max_h1_conn_number {
         builder = builder.max_h1_conn_number(max_h1_conn_number);
+    }
+    #[cfg(feature = "http2")]
+    if let Some(max_h2_conn_number) = config.max_h2_conn_number {
+        builder = builder.max_h2_conn_number(max_h2_conn_number);
+    }
+    #[cfg(feature = "http2")]
+    if let Some(allowed_cache_frame_size) = config.allowed_cache_frame_size {
+        builder = builder.allowed_cache_frame_size(allowed_cache_frame_size);
+    }
+    if let Some(list) = &config.tls13_ciphers {
+        builder = builder.tls_cipher_suite(list);
+    }
+    if let Some(groups) = &config.tls_groups {
+        builder = builder.tls_groups(groups);
     }
     if let Some(path) = &config.origin_ca_file {
         builder = builder.tls_ca_file(path);
@@ -260,6 +389,16 @@ fn build_client(config: &Config) -> Result<Client, HttpClientError> {
             .danger_accept_invalid_hostnames(true);
     }
     builder.build()
+}
+
+fn build_request_template(config: &Config) -> Result<RequestTemplate, HttpClientError> {
+    let uri = Uri::try_from(config.url.as_str()).map_err(|err| {
+        HttpClientError::other(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid URL: {err}"),
+        ))
+    })?;
+    Ok(RequestTemplate { uri })
 }
 
 async fn drain_body(mut response: Response, buf: &mut [u8]) -> Result<u64, HttpClientError> {
@@ -273,8 +412,14 @@ async fn drain_body(mut response: Response, buf: &mut [u8]) -> Result<u64, HttpC
     }
 }
 
-async fn one_request(client: &Client, url: &str, buf: &mut [u8]) -> Result<u64, HttpClientError> {
-    let request = Request::builder().url(url).body(Body::empty())?;
+async fn one_request(
+    client: &Client,
+    template: &RequestTemplate,
+    buf: &mut [u8],
+) -> Result<u64, HttpClientError> {
+    let request = Request::builder()
+        .uri(template.uri.clone())
+        .body(Body::empty())?;
     let response = client.request(request).await?;
     drain_body(response, buf).await
 }
@@ -282,21 +427,20 @@ async fn one_request(client: &Client, url: &str, buf: &mut [u8]) -> Result<u64, 
 async fn worker(
     client: Arc<Client>,
     config: Config,
+    template: RequestTemplate,
     count: usize,
     warmup_count: usize,
     duration: Option<Duration>,
     ready: Arc<Barrier>,
     start: Arc<Barrier>,
 ) -> WorkerResult {
-    let mut result = WorkerResult::default();
+    let latency_capacity = if duration.is_some() { 1024 } else { count };
+    let mut result = WorkerResult::with_capacity(latency_capacity);
     let mut read_buf = vec![0u8; config.read_buffer_size];
 
     for _ in 0..warmup_count {
-        if one_request(&client, &config.url, &mut read_buf)
-            .await
-            .is_err()
-        {
-            result.errors += 1;
+        if let Err(err) = one_request(&client, &template, &mut read_buf).await {
+            record_error(&mut result, format!("{err:?}"));
         }
     }
 
@@ -307,12 +451,12 @@ async fn worker(
         let deadline = Instant::now() + duration;
         while Instant::now() < deadline {
             let started = Instant::now();
-            match one_request(&client, &config.url, &mut read_buf).await {
+            match one_request(&client, &template, &mut read_buf).await {
                 Ok(bytes) => {
                     result.bytes += bytes;
                     result.latencies_us.push(started.elapsed().as_micros());
                 }
-                Err(_) => result.errors += 1,
+                Err(err) => record_error(&mut result, format!("{err:?}")),
             }
         }
         return result;
@@ -320,12 +464,12 @@ async fn worker(
 
     for _ in 0..count {
         let started = Instant::now();
-        match one_request(&client, &config.url, &mut read_buf).await {
+        match one_request(&client, &template, &mut read_buf).await {
             Ok(bytes) => {
                 result.bytes += bytes;
                 result.latencies_us.push(started.elapsed().as_micros());
             }
-            Err(_) => result.errors += 1,
+            Err(err) => record_error(&mut result, format!("{err:?}")),
         }
     }
 
@@ -334,6 +478,7 @@ async fn worker(
 
 async fn worker_with_owned_client(
     config: Config,
+    template: RequestTemplate,
     count: usize,
     warmup_count: usize,
     duration: Option<Duration>,
@@ -342,17 +487,34 @@ async fn worker_with_owned_client(
 ) -> WorkerResult {
     let client = match build_client(&config) {
         Ok(client) => Arc::new(client),
-        Err(_) => {
+        Err(err) => {
             ready.wait().await;
             start.wait().await;
-            return WorkerResult {
-                errors: warmup_count + if duration.is_some() { 1 } else { count },
+            let total_errors = warmup_count + if duration.is_some() { 1 } else { count };
+            let mut result = WorkerResult {
+                errors: total_errors,
                 ..WorkerResult::default()
             };
+            if total_errors != 0 {
+                result
+                    .error_samples
+                    .push(format!("failed to build client: {err:?}"));
+            }
+            return result;
         }
     };
 
-    worker(client, config, count, warmup_count, duration, ready, start).await
+    worker(
+        client,
+        config,
+        template,
+        count,
+        warmup_count,
+        duration,
+        ready,
+        start,
+    )
+    .await
 }
 
 fn percentile(values: &[u128], pct: usize) -> u128 {
@@ -383,12 +545,40 @@ fn option_u64_json(value: Option<u64>) -> String {
     value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
 
+fn record_error(result: &mut WorkerResult, error: String) {
+    result.errors += 1;
+    if result.error_samples.len() < MAX_ERROR_SAMPLES {
+        result.error_samples.push(error);
+    }
+}
+
+fn json_string_array(values: &[String]) -> String {
+    let mut json = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            json.push(',');
+        }
+        json.push('"');
+        json.push_str(&json_escape(value));
+        json.push('"');
+    }
+    json.push(']');
+    json
+}
+
 #[tokio::main]
 async fn main() {
     let config = match parse_args() {
         Ok(config) => config,
         Err(e) => {
             eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+    let request_template = match build_request_template(&config) {
+        Ok(template) => template,
+        Err(e) => {
+            eprintln!("failed to build request template: {e:?}");
             std::process::exit(2);
         }
     };
@@ -422,6 +612,7 @@ async fn main() {
                 handles.push(tokio::spawn(worker(
                     Arc::clone(client),
                     config.clone(),
+                    request_template.clone(),
                     count,
                     warmup_count,
                     duration,
@@ -431,6 +622,7 @@ async fn main() {
             }
             ClientMode::PerWorker => handles.push(tokio::spawn(worker_with_owned_client(
                 config.clone(),
+                request_template.clone(),
                 count,
                 warmup_count,
                 duration,
@@ -454,14 +646,25 @@ async fn main() {
     let mut latencies = Vec::with_capacity(latency_capacity);
     let mut bytes = 0u64;
     let mut errors = 0usize;
+    let mut error_samples = Vec::new();
     for handle in handles {
         match handle.await {
             Ok(mut result) => {
                 bytes += result.bytes;
                 errors += result.errors;
                 latencies.append(&mut result.latencies_us);
+                for sample in result.error_samples {
+                    if error_samples.len() < MAX_ERROR_SAMPLES {
+                        error_samples.push(sample);
+                    }
+                }
             }
-            Err(_) => errors += 1,
+            Err(err) => {
+                errors += 1;
+                if error_samples.len() < MAX_ERROR_SAMPLES {
+                    error_samples.push(format!("worker task failed: {err:?}"));
+                }
+            }
         }
     }
     let elapsed = measured_start.elapsed();
@@ -477,9 +680,9 @@ async fn main() {
 
     println!(
         "{{\"client\":\"ylong_http_client_async\",\"url\":\"{}\",\"proxy\":\"{}\",\
-         \"requests\":{},\"warmup_requests\":{},\"duration_seconds\":{},\"completed\":{},\"errors\":{},\
-         \"concurrency\":{},\"read_buffer_size\":{},\"client_mode\":\"{}\",\
-         \"max_h1_conn_number\":{},\"bytes\":{},\
+         \"requests\":{},\"warmup_requests\":{},\"duration_seconds\":{},\"completed\":{},\"errors\":{},\"error_samples\":{},\
+         \"concurrency\":{},\"read_buffer_size\":{},\"client_mode\":\"{}\",\"http_version\":\"{}\",\
+         \"max_h1_conn_number\":{},\"max_h2_conn_number\":{},\"allowed_cache_frame_size\":{},\"bytes\":{},\
          \"elapsed_ms\":{:.3},\"rps\":{:.3},\"latency_us_p50\":{},\
          \"latency_us_p90\":{},\"latency_us_p95\":{},\"latency_us_p99\":{},\
          \"latency_us_p999\":{}}}",
@@ -490,10 +693,14 @@ async fn main() {
         option_u64_json(config.duration_seconds),
         completed,
         errors,
+        json_string_array(&error_samples),
         config.concurrency,
         config.read_buffer_size,
         config.client_mode.as_str(),
+        config.http_version.as_str(),
         option_usize_json(config.max_h1_conn_number),
+        option_usize_json(config.max_h2_conn_number),
+        option_usize_json(config.allowed_cache_frame_size),
         bytes,
         elapsed.as_secs_f64() * 1000.0,
         rps,
@@ -514,7 +721,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_args_from;
+    use super::{parse_args_from, record_error, HttpVersionMode, WorkerResult, MAX_ERROR_SAMPLES};
 
     fn required_args() -> Vec<String> {
         vec![
@@ -546,5 +753,103 @@ mod tests {
         let err = parse_args_from(args).unwrap_err();
 
         assert_eq!(err, "--duration-seconds must be > 0");
+    }
+
+    #[test]
+    fn parses_tls13_ciphers() {
+        let mut args = required_args();
+        args.push("--tls13-ciphers".to_string());
+        args.push("TLS_AES_128_GCM_SHA256".to_string());
+
+        let config = parse_args_from(args).unwrap();
+
+        assert_eq!(
+            config.tls13_ciphers.as_deref(),
+            Some("TLS_AES_128_GCM_SHA256")
+        );
+    }
+
+    #[test]
+    fn parses_tls_groups() {
+        let mut args = required_args();
+        args.push("--tls-groups".to_string());
+        args.push("X25519".to_string());
+
+        let config = parse_args_from(args).unwrap();
+
+        assert_eq!(config.tls_groups.as_deref(), Some("X25519"));
+    }
+
+    #[test]
+    fn parses_http1_version_mode() {
+        let mut args = required_args();
+        args.push("--http-version".to_string());
+        args.push("h1".to_string());
+
+        let config = parse_args_from(args).unwrap();
+
+        assert_eq!(config.http_version, HttpVersionMode::Http1);
+    }
+
+    #[cfg(feature = "http2")]
+    #[test]
+    fn parses_http2_version_mode() {
+        let mut args = required_args();
+        args.push("--http-version".to_string());
+        args.push("h2".to_string());
+
+        let config = parse_args_from(args).unwrap();
+
+        assert_eq!(config.http_version, HttpVersionMode::Http2);
+    }
+
+    #[test]
+    fn rejects_unknown_http_version_mode() {
+        let mut args = required_args();
+        args.push("--http-version".to_string());
+        args.push("spdy".to_string());
+
+        let err = parse_args_from(args).unwrap_err();
+
+        assert_eq!(err, "invalid --http-version: spdy");
+    }
+
+    #[test]
+    fn records_error_samples_with_cap() {
+        let mut result = WorkerResult::default();
+
+        for index in 0..(MAX_ERROR_SAMPLES + 2) {
+            record_error(&mut result, format!("err-{index}"));
+        }
+
+        assert_eq!(result.errors, MAX_ERROR_SAMPLES + 2);
+        assert_eq!(result.error_samples.len(), MAX_ERROR_SAMPLES);
+        assert_eq!(result.error_samples[0], "err-0");
+        assert_eq!(
+            result.error_samples[MAX_ERROR_SAMPLES - 1],
+            format!("err-{}", MAX_ERROR_SAMPLES - 1)
+        );
+    }
+
+    #[test]
+    fn parses_allowed_cache_frame_size() {
+        let mut args = required_args();
+        args.push("--allowed-cache-frame-size".to_string());
+        args.push("64".to_string());
+
+        let config = parse_args_from(args).unwrap();
+
+        assert_eq!(config.allowed_cache_frame_size, Some(64));
+    }
+
+    #[test]
+    fn parses_max_h2_conn_number() {
+        let mut args = required_args();
+        args.push("--max-h2-conn-number".to_string());
+        args.push("4".to_string());
+
+        let config = parse_args_from(args).unwrap();
+
+        assert_eq!(config.max_h2_conn_number, Some(4));
     }
 }
