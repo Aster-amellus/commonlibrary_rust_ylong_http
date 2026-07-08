@@ -108,7 +108,7 @@ impl WorkerResult {
 
 #[derive(Clone)]
 struct RequestTemplate {
-    uri: Uri,
+    url: String,
 }
 
 fn usage(program: &str) {
@@ -326,9 +326,6 @@ fn proxy_tls_config(config: &Config) -> Result<TlsConfig, HttpClientError> {
     if let Some(list) = &config.tls13_ciphers {
         builder = builder.cipher_suite(list);
     }
-    if let Some(groups) = &config.tls_groups {
-        builder = builder.groups_list(groups);
-    }
     if let Some(path) = &config.proxy_ca_file {
         builder = builder.ca_file(path);
     }
@@ -347,6 +344,12 @@ fn proxy_tls_config(config: &Config) -> Result<TlsConfig, HttpClientError> {
 }
 
 fn build_client(config: &Config) -> Result<Client, HttpClientError> {
+    if config.tls_groups.is_some() {
+        return Err(HttpClientError::other(
+            "--tls-groups is not supported by ylong_http_client",
+        ));
+    }
+
     let mut proxy_builder =
         Proxy::all(config.proxy.as_str()).proxy_tls_config(proxy_tls_config(config)?);
     if let Some(user_pass) = &config.proxy_user_pass {
@@ -377,9 +380,6 @@ fn build_client(config: &Config) -> Result<Client, HttpClientError> {
     if let Some(list) = &config.tls13_ciphers {
         builder = builder.tls_cipher_suite(list);
     }
-    if let Some(groups) = &config.tls_groups {
-        builder = builder.tls_groups(groups);
-    }
     if let Some(path) = &config.origin_ca_file {
         builder = builder.tls_ca_file(path);
     }
@@ -398,7 +398,9 @@ fn build_request_template(config: &Config) -> Result<RequestTemplate, HttpClient
             format!("invalid URL: {err}"),
         ))
     })?;
-    Ok(RequestTemplate { uri })
+    Ok(RequestTemplate {
+        url: uri.to_string(),
+    })
 }
 
 async fn drain_body(mut response: Response, buf: &mut [u8]) -> Result<u64, HttpClientError> {
@@ -418,7 +420,7 @@ async fn one_request(
     buf: &mut [u8],
 ) -> Result<u64, HttpClientError> {
     let request = Request::builder()
-        .uri(template.uri.clone())
+        .url(template.url.as_str())
         .body(Body::empty())?;
     let response = client.request(request).await?;
     drain_body(response, buf).await
@@ -633,8 +635,6 @@ async fn main() {
     }
 
     ready.wait().await;
-    #[cfg(feature = "__bench_phase_metrics")]
-    ylong_http_client::reset_bench_phase_metrics();
     let measured_start = Instant::now();
     start.wait().await;
 
@@ -711,9 +711,6 @@ async fn main() {
         percentile_permille(&latencies, 999)
     );
 
-    #[cfg(feature = "__bench_phase_metrics")]
-    println!("{}", ylong_http_client::snapshot_bench_phase_metrics_json());
-
     if errors > 0 {
         std::process::exit(1);
     }
@@ -721,7 +718,10 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args_from, record_error, HttpVersionMode, WorkerResult, MAX_ERROR_SAMPLES};
+    use super::{
+        build_client, parse_args_from, record_error, HttpVersionMode, WorkerResult,
+        MAX_ERROR_SAMPLES,
+    };
 
     fn required_args() -> Vec<String> {
         vec![
@@ -778,6 +778,21 @@ mod tests {
         let config = parse_args_from(args).unwrap();
 
         assert_eq!(config.tls_groups.as_deref(), Some("X25519"));
+    }
+
+    #[test]
+    fn rejects_tls_groups_when_building_ylong_client() {
+        let mut config = parse_args_from(required_args()).unwrap();
+        config.tls_groups = Some("X25519".to_string());
+
+        let err = match build_client(&config) {
+            Ok(_) => panic!("build_client unexpectedly accepted --tls-groups"),
+            Err(err) => err,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("--tls-groups is not supported by ylong_http_client"));
     }
 
     #[test]

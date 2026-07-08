@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#1f2937"/>
+    </marker>
+    <style>
+      .bg { fill: #eaf2ff; }
+      .group { fill: #cfe1fb; stroke: #b7cdf1; stroke-width: 2; }
+      .module { fill: #fdeccf; stroke: #e7c98f; stroke-width: 2; rx: 8; }
+      .transport { fill: #dff4ee; stroke: #add8cc; stroke-width: 2; rx: 8; }
+      .external { fill: #e9e7ff; stroke: #c7c2f4; stroke-width: 2; rx: 8; }
+      .title { font: 700 36px sans-serif; fill: #0f172a; }
+      .group-title { font: 700 28px sans-serif; fill: #111827; }
+      .text { font: 24px sans-serif; fill: #111827; }
+      .small { font: 20px sans-serif; fill: #374151; }
+      .arrow { stroke: #1f2937; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+      .dash { stroke-dasharray: 8 8; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="900"/>
+  <text class="title" x="800" y="62" text-anchor="middle">ylong_http_client HTTPS Proxy Data Path</text>
+
+  <rect class="group" x="50" y="115" width="510" height="680"/>
+  <text class="group-title" x="305" y="158" text-anchor="middle">async_impl</text>
+
+  <rect class="module" x="110" y="195" width="390" height="72"/>
+  <text class="text" x="305" y="240" text-anchor="middle">ClientBuilder</text>
+
+  <rect class="module" x="110" y="315" width="390" height="72"/>
+  <text class="text" x="305" y="360" text-anchor="middle">ConnectionPool</text>
+
+  <rect class="module" x="110" y="435" width="390" height="72"/>
+  <text class="text" x="305" y="480" text-anchor="middle">HttpConnector</text>
+
+  <rect class="transport" x="110" y="555" width="390" height="72"/>
+  <text class="text" x="305" y="600" text-anchor="middle">MixStream</text>
+
+  <rect class="group" x="610" y="115" width="410" height="680"/>
+  <text class="group-title" x="815" y="158" text-anchor="middle">async_impl::proxy</text>
+
+  <rect class="module" x="665" y="195" width="300" height="72"/>
+  <text class="text" x="815" y="240" text-anchor="middle">ProxyRoute</text>
+
+  <rect class="module" x="665" y="315" width="300" height="72"/>
+  <text class="text" x="815" y="348" text-anchor="middle">Proxy TLS</text>
+  <text class="small" x="815" y="374" text-anchor="middle">CA / cert / key / ciphers</text>
+
+  <rect class="module" x="665" y="435" width="300" height="72"/>
+  <text class="text" x="815" y="480" text-anchor="middle">CONNECT Tunnel</text>
+
+  <rect class="transport" x="665" y="555" width="300" height="72"/>
+  <text class="text" x="815" y="588" text-anchor="middle">Origin TLS</text>
+  <text class="small" x="815" y="614" text-anchor="middle">separate TLS config</text>
+
+  <rect class="group" x="1070" y="115" width="480" height="680"/>
+  <text class="group-title" x="1310" y="158" text-anchor="middle">Network</text>
+
+  <rect class="external" x="1140" y="235" width="340" height="92"/>
+  <text class="text" x="1310" y="272" text-anchor="middle">HTTPS Proxy</text>
+  <text class="small" x="1310" y="302" text-anchor="middle">TLS verified or mTLS</text>
+
+  <rect class="external" x="1140" y="535" width="340" height="92"/>
+  <text class="text" x="1310" y="572" text-anchor="middle">HTTPS Origin</text>
+  <text class="small" x="1310" y="602" text-anchor="middle">inside CONNECT tunnel</text>
+
+  <path class="arrow" d="M305,267 L305,315"/>
+  <path class="arrow" d="M305,387 L305,435"/>
+  <path class="arrow" d="M305,507 L305,555"/>
+
+  <path class="arrow" d="M500,231 L665,231"/>
+  <path class="arrow" d="M500,471 L665,231"/>
+  <path class="arrow" d="M965,231 L1140,281"/>
+
+  <path class="arrow" d="M815,267 L815,315"/>
+  <path class="arrow" d="M815,387 L815,435"/>
+  <path class="arrow" d="M815,507 L815,555"/>
+
+  <path class="arrow" d="M965,351 L1140,281"/>
+  <path class="arrow" d="M965,471 L1140,281"/>
+  <path class="arrow dash" d="M965,591 L1140,581"/>
+
+  <path class="arrow" d="M500,591 L665,591"/>
+  <path class="arrow dash" d="M1310,327 L1310,535"/>
+
+  <rect class="module" x="110" y="685" width="390" height="72"/>
+  <text class="text" x="305" y="718" text-anchor="middle">PoolKey</text>
+  <text class="small" x="305" y="744" text-anchor="middle">target + proxy identity</text>
+
+  <path class="arrow" d="M305,627 L305,685"/>
+  <path class="arrow" d="M500,721 L665,231"/>
+
+  <text class="small" x="1040" y="678">Solid arrows: setup/calls</text>
+  <text class="small" x="1040" y="708">Dashed arrows: tunneled origin TLS data</text>
+  <text class="small" x="1040" y="738">Proxy TLS config and origin TLS config are isolated</text>
+</svg>

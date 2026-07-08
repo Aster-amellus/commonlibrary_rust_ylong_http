@@ -243,6 +243,25 @@ mod ut_proxy_route {
     }
 
     #[test]
+    fn ut_proxy_route_https_proxy_no_proxy_uses_direct_route() {
+        let uri = Uri::from_bytes(b"https://origin.example.com/data").unwrap();
+        let mut proxy = Proxy::all("https://proxy.example.com:8443").unwrap();
+        proxy.no_proxy("origin.example.com");
+
+        let mut proxies = Proxies::default();
+        proxies.add_proxy(proxy);
+
+        let route = ProxyRoute::resolve(&proxies, &uri);
+        assert!(!route.is_proxied());
+        assert!(route.pool_key().is_none());
+        assert_eq!(
+            route.next_hop_authority(&uri).to_string(),
+            "origin.example.com"
+        );
+        route.ensure_supported().unwrap();
+    }
+
+    #[test]
     fn ut_proxy_route_basic_auth() {
         let uri = Uri::from_bytes(b"https://origin.example.com/data").unwrap();
         let mut proxy = Proxy::all("http://proxy.example.com:8080").unwrap();

@@ -299,6 +299,53 @@ fn sdv_https_target_over_https_proxy() {
 }
 
 #[test]
+fn sdv_https_proxy_connect_failure_stops_before_origin_tls() {
+    let proxy = start_proxy(|listener| {
+        let mut outer = accept_proxy_tls(listener, false)?;
+        let connect = read_headers(&mut outer)?;
+        if !connect.starts_with("CONNECT foobar.com:443 HTTP/1.1\r\n") {
+            return Err(format!("unexpected CONNECT request: {connect}"));
+        }
+        outer
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            .map_err(|e| e.to_string())?;
+        outer.flush().map_err(|e| e.to_string())?;
+
+        let mut probe = [0u8; 1];
+        match outer.read(&mut probe) {
+            Ok(0) => Ok(()),
+            Ok(_) => Err("client attempted origin TLS after CONNECT failure".to_string()),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    });
+
+    let proxy_config = Proxy::all(format!("https://{}", proxy.addr).as_str())
+        .proxy_tls_config(proxy_tls_config(false).unwrap())
+        .build()
+        .unwrap();
+    let client = Client::builder()
+        .proxy(proxy_config)
+        .tls_ca_file(ROOT_CA)
+        .build()
+        .unwrap();
+    let request = RequestBuilder::new()
+        .method("GET")
+        .url("https://foobar.com/data")
+        .body(Body::empty())
+        .unwrap();
+
+    let result = ylong_runtime::block_on(async move { client.request(request).await });
+    assert!(result.is_err());
+    proxy.finish();
+}
+
+#[test]
 fn sdv_https_proxy_mtls_success() {
     let proxy = start_proxy(|listener| {
         let mut stream = accept_proxy_tls(listener, true)?;

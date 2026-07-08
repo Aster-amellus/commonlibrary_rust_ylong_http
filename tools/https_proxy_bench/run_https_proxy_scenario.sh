@@ -95,12 +95,17 @@ print_command() {
     printf '\n'
 }
 
+fixture_command=(tools/https_proxy_bench/run_https_proxy_fixture_rs.sh "${fixture_args[@]}")
+if [[ -n "${FIXTURE_CPU_LIST:-}" ]]; then
+    fixture_command=(taskset -c "$FIXTURE_CPU_LIST" "${fixture_command[@]}")
+fi
+
 bench_env=(
     FRAME_POINTERS="${FRAME_POINTERS:-1}"
     CLIENT_FILTER="${CLIENT_FILTER:-both}"
     YLONG_CLIENT_MODE="${YLONG_CLIENT_MODE:-shared}"
-    YLONG_PHASE_METRICS="${YLONG_PHASE_METRICS:-0}"
     YLONG_MAX_H1_CONN_NUMBER="${YLONG_MAX_H1_CONN_NUMBER:-}"
+    BENCH_CPU_LIST="${BENCH_CPU_LIST:-}"
     PROFILE="${PROFILE:-}"
     PERF_EVENTS="${PERF_EVENTS:-task-clock,cycles,instructions,cache-misses,context-switches,cpu-migrations,page-faults}"
 )
@@ -109,7 +114,7 @@ printf 'scenario=%s\n' "$SCENARIO_NAME"
 printf 'layer=%s\n\n' "$SCENARIO_LAYER"
 
 printf 'Start fixture in another terminal:\n\n'
-print_command tools/https_proxy_bench/run_https_proxy_fixture_rs.sh "${fixture_args[@]}"
+print_command "${fixture_command[@]}"
 
 printf '\nLow-level benchmark command for this scenario:\n\n'
 print_command env "${bench_env[@]}" tools/https_proxy_bench/run_https_proxy_bench.sh "${bench_args[@]}"

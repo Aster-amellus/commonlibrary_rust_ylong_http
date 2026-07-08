@@ -8,6 +8,43 @@ capability to meet the needs of communication scenarios.
 `ylong_http` is written in the Rust language to support OpenHarmony's Rust
 capability.
 
+## Preliminary HTTPS Proxy Deliverables
+
+This branch adds async HTTPS proxy support for `ylong_http_client`.
+
+Deliverable index:
+
+- Technical solution: [docs/preliminary_solution.md](./docs/preliminary_solution.md)
+- Benchmark protocol: [docs/benchmark_report.md](./docs/benchmark_report.md)
+- IP and dependency statement: [docs/ip_and_dependencies.md](./docs/ip_and_dependencies.md)
+- Benchmark harness: [tools/https_proxy_bench/README.md](./tools/https_proxy_bench/README.md)
+- Usage guide: [docs/user_guide.md](./docs/user_guide.md)
+
+The HTTPS proxy data path is:
+
+![https_proxy_architecture](./figures/https_proxy_architecture.png)
+
+Quick verification:
+
+The OpenSSL FFI build expects OpenSSL library and include paths. On most Linux
+hosts with `pkg-config`, export them before running TLS-enabled cargo commands:
+
+```bash
+export OPENSSL_LIB_DIR=$(pkg-config --variable=libdir openssl)
+export OPENSSL_INCLUDE_DIR=$(pkg-config --variable=includedir openssl)
+```
+
+```bash
+cargo test -p ylong_http_client --test sdv_async_https_proxy \
+  --features "async http1_1 ylong_base c_openssl_3_0" --release
+
+cargo test -p ylong_http_client --lib ut_proxy_route \
+  --features "async http1_1 tokio_base c_openssl_3_0" --release
+
+tools/https_proxy_bench/run_https_proxy_scenario.sh \
+  tools/https_proxy_bench/scenarios/correctness_https_proxy.env
+```
+
 ### The position of ylong_http in OpenHarmony
 
 `ylong_http` provides HTTP protocol support to the `netstack` module in the
@@ -104,6 +141,7 @@ ylong_http
     │   ├── async_impl          # Asynchronous client implementation
     │   │   ├── conn            # Asynchronous connection layer
     │   │   ├── downloader      # Asynchronous downloader layer
+    │   │   ├── proxy           # Asynchronous HTTP/HTTPS proxy routing and tunnel layer
     │   │   ├── ssl_stream      # Asynchronous TLS layer
     │   │   └── uploader        # Asynchronous uploader layer
     │   ├── sync_impl           # Synchronous client implementation

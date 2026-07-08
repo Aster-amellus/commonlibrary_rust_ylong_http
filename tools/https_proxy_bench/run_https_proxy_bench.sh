@@ -12,7 +12,7 @@ if [[ "$#" -eq 0 || "$*" == *"--help"* ]]; then
     cat <<'USAGE'
 usage: tools/https_proxy_bench/run_https_proxy_bench.sh --url URL --proxy http[s]://PROXY[:PORT] [options]
 
-Options forwarded to both clients:
+Common options:
   --requests N
   --warmup-requests N
   --duration-seconds N
@@ -27,16 +27,15 @@ Options forwarded to both clients:
   --proxy-user-pass user:pass
   --http-version h1|h2|negotiate
   --tls13-ciphers LIST
-  --tls-groups LIST
+  --tls-groups LIST   libcurl-only comparator option; ylong rejects it
 
 Environment:
   PROFILE=perf-stat    run each client under perf stat when available
   PROFILE=time         run each client under /usr/bin/time -v when available
   PERF_EVENTS=EVENTS   perf stat events, comma-separated
+  BENCH_CPU_LIST=LIST pin measured client commands with taskset -c LIST
   CLIENT_FILTER=both|ylong|libcurl
   YLONG_CLIENT_MODE=shared|per-worker
-  YLONG_PHASE_METRICS=1 enable ylong benchmark-only phase metrics
-  YLONG_EXTRA_FEATURES="..." append internal ylong benchmark features
   YLONG_MAX_H1_CONN_NUMBER=N ylong-only max HTTP/1 connections per pool key
   YLONG_MAX_H2_CONN_NUMBER=N ylong-only max HTTP/2 connections per pool key
   YLONG_ALLOWED_CACHE_FRAME_SIZE=N ylong-only HTTP/2 response frame channel capacity
@@ -94,13 +93,6 @@ for ((i = 0; i < ${#args[@]}; i++)); do
         esac
     fi
 done
-if [[ "${YLONG_PHASE_METRICS:-0}" == "1" ]]; then
-    ylong_features="$ylong_features __bench_phase_metrics"
-fi
-if [[ -n "${YLONG_EXTRA_FEATURES:-}" ]]; then
-    ylong_features="$ylong_features $YLONG_EXTRA_FEATURES"
-fi
-
 if [[ "$client_filter" != "libcurl" ]]; then
     cargo build -p ylong_http_client --example async_https_proxy_bench \
         --features "$ylong_features" --release
@@ -145,6 +137,15 @@ case "${PROFILE:-}" in
         exit 2
         ;;
 esac
+
+if [[ -n "${BENCH_CPU_LIST:-}" ]]; then
+    if command -v taskset >/dev/null 2>&1; then
+        prefix=(taskset -c "$BENCH_CPU_LIST" "${prefix[@]}")
+    else
+        echo "BENCH_CPU_LIST requested but taskset is unavailable" >&2
+        exit 2
+    fi
+fi
 
 json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'

@@ -6,6 +6,43 @@ ylong_http 构建了完整的 HTTP 能力，支持用户使用 HTTP 能力完成
 
 ylong_http 使用 Rust 编写，为 OpenHarmony 的 Rust 能力构筑提供支持。
 
+## 初赛 HTTPS 代理交付件
+
+本分支为 `ylong_http_client` 增加异步 HTTPS 代理能力。
+
+交付件索引：
+
+- 技术方案：[docs/preliminary_solution.md](./docs/preliminary_solution.md)
+- 性能测试报告与复现协议：[docs/benchmark_report.md](./docs/benchmark_report.md)
+- 知识产权与第三方依赖说明：[docs/ip_and_dependencies.md](./docs/ip_and_dependencies.md)
+- benchmark 工具说明：[tools/https_proxy_bench/README.md](./tools/https_proxy_bench/README.md)
+- 用户指南：[docs/user_guide.md](./docs/user_guide.md)
+
+HTTPS 代理数据路径：
+
+![https_proxy_architecture](./figures/https_proxy_architecture.png)
+
+快速验证：
+
+OpenSSL FFI 构建需要 OpenSSL 库和头文件路径。大多数 Linux 环境可通过
+`pkg-config` 设置：
+
+```bash
+export OPENSSL_LIB_DIR=$(pkg-config --variable=libdir openssl)
+export OPENSSL_INCLUDE_DIR=$(pkg-config --variable=includedir openssl)
+```
+
+```bash
+cargo test -p ylong_http_client --test sdv_async_https_proxy \
+  --features "async http1_1 ylong_base c_openssl_3_0" --release
+
+cargo test -p ylong_http_client --lib ut_proxy_route \
+  --features "async http1_1 tokio_base c_openssl_3_0" --release
+
+tools/https_proxy_bench/run_https_proxy_scenario.sh \
+  tools/https_proxy_bench/scenarios/correctness_https_proxy.env
+```
+
 ### ylong_http 在 OpenHarmony 中的位置
 
 ylong_http 向 OpenHarmony 系统服务层中的网络协议栈模块提供 HTTP 协议支持，经由网络协议栈模块帮助上层应用建立 HTTP 通信能力。
@@ -100,6 +137,7 @@ ylong_http
     │   ├── async_impl          # ylong_http_client 异步客户端实现
     │   │   ├── conn            # 异步连接层
     │   │   ├── downloader      # 异步下载器实现
+    │   │   ├── proxy           # 异步 HTTP/HTTPS 代理路由与隧道层
     │   │   ├── ssl_stream      # 异步 tls 适配层
     │   │   └── uploader        # 异步上传器实现   
     │   ├── sync_impl           # ylong_http_client 同步客户端实现
